@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Experimental: installed from a git subdirectory or in editable mode, never
+# published to PyPI. See ../README.md.
+[project]
+name = "quant_suite_mx_plus"
+dynamic = ["version"]
+description = "MX+ (extra mantissa bits on each block's largest element) as a QuantSuite extension"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: BSD License",
+]
+dependencies = [
+    "quant_suite_core>=0.1.0",
+    "quant_suite_recipe>=0.1.0",
+    "torch>=2.13",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[project.entry-points."quant_suite.recipe_runtimes"]
+mx_plus = "mx_plus.runtime:RUNTIME"
+
+[project.urls]
+Homepage = "https://github.com/meta-pytorch/quant-suite"
+Repository = "https://github.com/meta-pytorch/quant-suite"
+Issues = "https://github.com/meta-pytorch/quant-suite/issues"
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mx_plus.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mx_plus*"]
+
+[tool.setuptools.package-data]
+mx_plus = ["py.typed"]

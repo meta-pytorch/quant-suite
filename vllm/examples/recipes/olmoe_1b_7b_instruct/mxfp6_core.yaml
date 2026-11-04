@@ -1,0 +1,12 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+moe_recipe:
+  '.*':
+    a1: fake_mxfp6
+    w13: fake_mxfp6
+    a2: fake_mxfp6
+    w2: fake_mxfp6

@@ -1,0 +1,244 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+models:
+  llama_3_1_8b_instruct:
+    model_id: meta-llama/Llama-3.1-8B-Instruct
+    revision: 0e9e39f249a16976918f6564b8830bc894c89659
+    attention_kind: gqa
+    max_model_len: 16384
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    trust_remote_code: false
+    server_seed: 0
+    request_seed: 0
+    evaluation_protocol: lm_eval_0_4_13_gsm8k_llama_v3_8shot_multiturn_chat
+    configs:
+      bf16:
+        recipe: null
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      bf16_custom_noop:
+        recipe: recipes/llama_3_1_8b_instruct/bf16_custom_noop.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp8_core:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp8_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp8_qkvp_all:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp8_qkvp_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp6_core:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp6_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp6_qkvp_all:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp6_qkvp_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp4_ocp_core:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp4_ocp_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp4_16_floor_core:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp4_16_floor_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp4_core:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp4_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp4_kv_all:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp4_kv_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp4_qkvp_first:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp4_qkvp_first.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp4_qkvp_all:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp4_qkvp_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp4_mbs128_core:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp4_mbs128_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp4_mbs128_wdyn_core:
+        recipe: recipes/llama_3_1_8b_instruct/mxfp4_mbs128_wdyn_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      nvfp4_core:
+        recipe: recipes/llama_3_1_8b_instruct/nvfp4_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      nvfp4_qkvp_all:
+        recipe: recipes/llama_3_1_8b_instruct/nvfp4_qkvp_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+
+  qwen3_8b:
+    model_id: Qwen/Qwen3-8B
+    revision: 2069b3fae1114555f3c020c81410e51fa0f656f2
+    attention_kind: gqa
+    max_model_len: 16384
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    trust_remote_code: false
+    server_seed: 0
+    request_seed: 0
+    evaluation_protocol: lm_eval_0_4_13_gsm8k_llama_v3_8shot_multiturn_chat
+    chat_template_kwargs:
+      enable_thinking: false
+    configs:
+      bf16:
+        recipe: null
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      bf16_custom_noop:
+        recipe: recipes/qwen3_8b/bf16_custom_noop.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp8_core:
+        recipe: recipes/qwen3_8b/mxfp8_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp8_qkvp_all:
+        recipe: recipes/qwen3_8b/mxfp8_qkvp_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp6_core:
+        recipe: recipes/qwen3_8b/mxfp6_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp6_qkvp_all:
+        recipe: recipes/qwen3_8b/mxfp6_qkvp_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp4_ocp_core:
+        recipe: recipes/qwen3_8b/mxfp4_ocp_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp4_16_floor_core:
+        recipe: recipes/qwen3_8b/mxfp4_16_floor_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp4_core:
+        recipe: recipes/qwen3_8b/mxfp4_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp4_kv_all:
+        recipe: recipes/qwen3_8b/mxfp4_kv_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp4_qkvp_first:
+        recipe: recipes/qwen3_8b/mxfp4_qkvp_first.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp4_qkvp_all:
+        recipe: recipes/qwen3_8b/mxfp4_qkvp_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+      mxfp4_mbs128_core:
+        recipe: recipes/qwen3_8b/mxfp4_mbs128_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      mxfp4_mbs128_wdyn_core:
+        recipe: recipes/qwen3_8b/mxfp4_mbs128_wdyn_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      nvfp4_core:
+        recipe: recipes/qwen3_8b/nvfp4_core.yaml
+        attention_backend: FLASH_ATTN
+        client_concurrency: 256
+      nvfp4_qkvp_all:
+        recipe: recipes/qwen3_8b/nvfp4_qkvp_all.yaml
+        attention_backend: CUSTOM
+        client_concurrency: 8
+        request_timeout_seconds: 1800
+
+  olmoe_1b_7b_instruct:
+    model_id: allenai/OLMoE-1B-7B-0924-Instruct
+    revision: 7f1c97f440f06ce36705e4f2b843edb5925f4498
+    attention_kind: mha
+    max_model_len: 4096
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    trust_remote_code: false
+    evaluation_protocol: chat
+    recipes:
+      bf16: null
+      mxfp8_core: recipes/olmoe_1b_7b_instruct/mxfp8_core.yaml
+      mxfp8_qkvp_all: recipes/olmoe_1b_7b_instruct/mxfp8_qkvp_all.yaml
+      mxfp6_core: recipes/olmoe_1b_7b_instruct/mxfp6_core.yaml
+      mxfp6_qkvp_all: recipes/olmoe_1b_7b_instruct/mxfp6_qkvp_all.yaml
+      mxfp4_core: recipes/olmoe_1b_7b_instruct/mxfp4_core.yaml
+      mxfp4_kv_all: recipes/olmoe_1b_7b_instruct/mxfp4_kv_all.yaml
+      mxfp4_qkvp_first: recipes/olmoe_1b_7b_instruct/mxfp4_qkvp_first.yaml
+      mxfp4_qkvp_all: recipes/olmoe_1b_7b_instruct/mxfp4_qkvp_all.yaml
+      nvfp4_core: recipes/olmoe_1b_7b_instruct/nvfp4_core.yaml
+      nvfp4_qkvp_all: recipes/olmoe_1b_7b_instruct/nvfp4_qkvp_all.yaml
+
+  deepseek_v2_lite_chat:
+    model_id: deepseek-ai/DeepSeek-V2-Lite-Chat
+    revision: 85864749cd611b4353ce1decdb286193298f64c7
+    attention_kind: mla
+    max_model_len: 8192
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    trust_remote_code: false
+    evaluation_protocol: published_8shot_single_user_template
+    primary_metric: flexible_numeric_exact_match
+    recipes:
+      bf16: null
+      mxfp8_core: recipes/deepseek_v2_lite_chat/mxfp8_core.yaml
+      mxfp8_qkvp_all: recipes/deepseek_v2_lite_chat/mxfp8_qkvp_all.yaml
+      mxfp6_core: recipes/deepseek_v2_lite_chat/mxfp6_core.yaml
+      mxfp6_qkvp_all: recipes/deepseek_v2_lite_chat/mxfp6_qkvp_all.yaml
+      mxfp4_core: recipes/deepseek_v2_lite_chat/mxfp4_core.yaml
+      mxfp4_kv_all: recipes/deepseek_v2_lite_chat/mxfp4_kv_all.yaml
+      mxfp4_qkvp_first: recipes/deepseek_v2_lite_chat/mxfp4_qkvp_first.yaml
+      mxfp4_qkvp_all: recipes/deepseek_v2_lite_chat/mxfp4_qkvp_all.yaml
+      nvfp4_core: recipes/deepseek_v2_lite_chat/nvfp4_core.yaml
+      nvfp4_qkvp_all: recipes/deepseek_v2_lite_chat/nvfp4_qkvp_all.yaml
+
+  kimi_linear_48b_a3b_base:
+    model_id: moonshotai/Kimi-Linear-48B-A3B-Base
+    revision: 3b171c17bfc4ee348599b6781a2ca8715c21c8dc
+    attention_kind: mla
+    max_model_len: 8192
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    trust_remote_code: true
+    evaluation_protocol: completions
+    recipes:
+      bf16: null
+      mxfp8_core: recipes/kimi_linear_48b_a3b_base/mxfp8_core.yaml
+      mxfp8_qkvp_all: recipes/kimi_linear_48b_a3b_base/mxfp8_qkvp_all.yaml
+      mxfp6_core: recipes/kimi_linear_48b_a3b_base/mxfp6_core.yaml
+      mxfp6_qkvp_all: recipes/kimi_linear_48b_a3b_base/mxfp6_qkvp_all.yaml
+      mxfp4_core: recipes/kimi_linear_48b_a3b_base/mxfp4_core.yaml
+      mxfp4_kv_all: recipes/kimi_linear_48b_a3b_base/mxfp4_kv_all.yaml
+      mxfp4_qkvp_first: recipes/kimi_linear_48b_a3b_base/mxfp4_qkvp_first.yaml
+      mxfp4_qkvp_all: recipes/kimi_linear_48b_a3b_base/mxfp4_qkvp_all.yaml
+      mxfp4_kda_state_all: recipes/kimi_linear_48b_a3b_base/mxfp4_kda_state_all.yaml
+      nvfp4_core: recipes/kimi_linear_48b_a3b_base/nvfp4_core.yaml
+      nvfp4_qkvp_all: recipes/kimi_linear_48b_a3b_base/nvfp4_qkvp_all.yaml

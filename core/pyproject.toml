@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant_suite_core"
+dynamic = ["version"]
+description = "Tensor-level quantization building blocks for low-precision formats"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: BSD License",
+]
+dependencies = [
+    "torch>=2.13",
+]
+
+[project.optional-dependencies]
+test = [
+    "numpy",
+    "parameterized",
+]
+
+[project.urls]
+Homepage = "https://github.com/meta-pytorch/quant-suite"
+Repository = "https://github.com/meta-pytorch/quant-suite"
+Issues = "https://github.com/meta-pytorch/quant-suite/issues"
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.dynamic]
+version = {attr = "quant_suite_core.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quant_suite_core*"]
+
+[tool.setuptools.package-data]
+quant_suite_core = ["py.typed"]

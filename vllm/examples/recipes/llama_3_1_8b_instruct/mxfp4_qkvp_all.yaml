@@ -1,0 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+linear_recipe:
+  '.*':
+    activation: fake_mxfp4
+    weight: fake_mxfp4
+    bias: none
+attention_recipe:
+  '^model\.layers\.(?:[0-9]|[12][0-9]|3[01])\.self_attn\.attn$':
+    q: fake_mxfp4
+    k: fake_mxfp4
+    v: fake_mxfp4
+    attn_weights: fake_mxfp4

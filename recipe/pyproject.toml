@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant_suite_recipe"
+dynamic = ["version"]
+description = "Quantization recipes and execution runtime for QuantSuite"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: BSD License",
+]
+dependencies = [
+    "PyYAML>=6.0",
+    "quant_suite_core>=0.1.0",
+    "torch>=2.13",
+]
+
+[project.optional-dependencies]
+native = ["mslk>=1.0.0"]
+test = ["parameterized"]
+
+[project.urls]
+Homepage = "https://github.com/meta-pytorch/quant-suite"
+Repository = "https://github.com/meta-pytorch/quant-suite"
+Issues = "https://github.com/meta-pytorch/quant-suite/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "quant_suite_recipe.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quant_suite_recipe*"]
+
+[tool.setuptools.package-data]
+quant_suite_recipe = ["py.typed"]

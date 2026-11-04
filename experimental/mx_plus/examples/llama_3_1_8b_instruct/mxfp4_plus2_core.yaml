@@ -1,0 +1,29 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# This example applies MXFP4 + MX+ (two extra mantissa bits on each block's
+# largest element) to the linear layers, the configuration the MX+ paper
+# reports; the same config can be used for any tensor. It writes the config in
+# two of the forms a fake-quant config accepts; ../../README.md also shows the
+# inline mapping. With the package installed, the QuantSuite vLLM plugin serves
+# it through mx_plus.runtime.RUNTIME:
+#
+#   pip install -e experimental/mx_plus
+#   ATTENTION_BACKEND=FLASH_ATTN vllm/examples/serve.sh \
+#     meta-llama/Llama-3.1-8B-Instruct \
+#     experimental/mx_plus/examples/llama_3_1_8b_instruct/mxfp4_plus2_core.yaml gqa
+#
+# Elsewhere, load it with mx_plus.runtime.RUNTIME; see ../../README.md.
+
+linear_recipe:
+  '.*':
+    # 1. Preset shorthand.
+    weight: fake_mxfp4_plus2
+    # 2. Preset name, explicit form.
+    activation:
+      type: fake
+      quant_config: mxfp4_plus2
+    bias: none

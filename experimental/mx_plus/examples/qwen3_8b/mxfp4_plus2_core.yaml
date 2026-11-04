@@ -1,0 +1,22 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# This example applies MXFP4 + MX+ (two extra mantissa bits on each block's
+# largest element) to the linear layers of Qwen3-8B, the configuration the MX+
+# paper reports; the same config can be used for any tensor. With the package
+# installed, the QuantSuite vLLM plugin serves it through
+# mx_plus.runtime.RUNTIME:
+#
+#   pip install -e experimental/mx_plus
+#   ATTENTION_BACKEND=FLASH_ATTN vllm/examples/serve.sh Qwen/Qwen3-8B \
+#     experimental/mx_plus/examples/qwen3_8b/mxfp4_plus2_core.yaml gqa \
+#     --default-chat-template-kwargs '{"enable_thinking": false}'
+
+linear_recipe:
+  '.*':
+    activation: fake_mxfp4_plus2
+    weight: fake_mxfp4_plus2
+    bias: none

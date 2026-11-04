@@ -1,0 +1,26 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+linear_recipe:
+  '.*':
+    activation: fake_mxfp8
+    weight: fake_mxfp8
+    bias: fake_mxfp8
+
+moe_recipe:
+  '.*':
+    a1: fake_mxfp8
+    w13: fake_mxfp8
+    a2: fake_mxfp8
+    w2: fake_mxfp8
+
+attention_recipe:
+  '.*':
+    q: none
+    k: none
+    v: none
+    attn_weights: none
+    recurrent_state: fake_mxfp8

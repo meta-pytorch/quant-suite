@@ -1,0 +1,19 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+linear_recipe:
+  '.*':
+    activation: &mxfp4_16
+      type: fake
+      quant_config:
+        elem_dtype: e2m1
+        elem_round_mode: nearest
+        block_size: 1x16
+        scale_dtype: e8m0
+        scale_norm_mode: pow2max
+        scale_round_mode: floor
+    weight: *mxfp4_16
+    bias: none

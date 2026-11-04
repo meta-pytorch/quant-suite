@@ -1,0 +1,16 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+moe_recipe:
+  '.*':
+    a1: fake_mxfp4
+    w13: fake_mxfp4
+    a2: fake_mxfp4
+    w2: fake_mxfp4
+attention_recipe:
+  '^model\.layers\.(?:3|7|11|15|19|23|26)\.self_attn$':
+    k: fake_mxfp4
+    v: fake_mxfp4

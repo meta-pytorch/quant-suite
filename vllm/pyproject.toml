@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant_suite_vllm"
+dynamic = ["version"]
+description = "vLLM integration for QuantSuite"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: BSD License",
+]
+dependencies = [
+    "quant_suite_core>=0.1.0",
+    "quant_suite_recipe>=0.1.0",
+    "torch>=2.13",
+    "vllm>=0.30,<0.31",
+]
+
+[project.urls]
+Homepage = "https://github.com/meta-pytorch/quant-suite"
+Repository = "https://github.com/meta-pytorch/quant-suite"
+Issues = "https://github.com/meta-pytorch/quant-suite/issues"
+
+[project.entry-points."vllm.general_plugins"]
+quant_suite = "quant_suite_vllm.plugin:register"
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.dynamic]
+version = {attr = "quant_suite_vllm.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quant_suite_vllm*"]
+
+[tool.setuptools.package-data]
+quant_suite_vllm = ["py.typed"]

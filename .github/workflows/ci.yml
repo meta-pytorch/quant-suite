@@ -1,0 +1,78 @@
+# CPU-only CI: installs the packages from this checkout and runs their tests.
+#
+# Each package's tests run in a separate pytest invocation, because several
+# packages have test files with the same basename and the tests directories
+# are not Python packages. Tests that need a CUDA GPU or MSLK skip themselves
+# on these runners. The vLLM package is only built, because importing vLLM
+# needs its CUDA wheel.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-cpu:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install PyTorch (CPU) and Triton
+        # The CPU torch wheel does not pull in Triton, but quant_suite_core
+        # imports it at package import time.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch>=2.13" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install triton
+
+      - name: Install QuantSuite packages
+        run: |
+          python -m pip install pytest \
+            -e "core[test]" \
+            -e "recipe[test]" \
+            -e "experimental/mx_plus[test]"
+
+      - name: Test quant_suite_core
+        run: pytest core/tests -rs
+
+      - name: Test quant_suite_recipe
+        run: pytest recipe/tests -rs
+
+      - name: Test mx_plus
+        run: pytest experimental/mx_plus/tests -rs
+
+  build-vllm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build quant_suite_vllm wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel vllm
