@@ -45,6 +45,7 @@ _ALLOWED_VLLM_MODULES: frozenset[str] = frozenset(
         "vllm.distributed.parallel_state",
         "vllm.envs",
         "vllm.forward_context",
+        "vllm.model_executor.layers.attention",
     }
 )
 

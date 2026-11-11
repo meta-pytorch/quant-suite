@@ -18,8 +18,11 @@ _STEPS_ENV = "QUANT_SUITE_TENSOR_DUMP_STEPS"
 _PHASE_ENV = "QUANT_SUITE_TENSOR_DUMP_PHASE"
 _MAX_STEPS_ENV = "QUANT_SUITE_TENSOR_DUMP_MAX_STEPS"
 _RANKS_ENV = "QUANT_SUITE_TENSOR_DUMP_RANKS"
+_ATTENTION_ENV = "QUANT_SUITE_TENSOR_DUMP_ATTENTION"
+_ATTENTION_TENSORS_ENV = "QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS"
 
 _PHASES: frozenset[str] = frozenset({"prefill", "decode", "mixed"})
+_ATTENTION_TENSORS: frozenset[str] = frozenset({"q", "k", "v", "output"})
 _INT_RE: re.Pattern[str] = re.compile(r"[0-9]+")
 _RANGE_RE: re.Pattern[str] = re.compile(r"([0-9]+):([0-9]*)")
 
@@ -35,6 +38,9 @@ class _DumpOptions:
         phases: Step phases that are written.
         max_steps: Cap on the number of steps written; 0 means no cap.
         ranks: Global ranks that write; ``None`` means every rank.
+        attention: Attention layers that write, matched against vLLM's layer
+            name with ``re.match``; ``None`` means no attention layer.
+        attention_tensors: Tensors each selected attention layer writes.
     """
 
     directory: Path
@@ -42,6 +48,8 @@ class _DumpOptions:
     phases: frozenset[str]
     max_steps: int
     ranks: frozenset[int] | None
+    attention: re.Pattern[str] | None
+    attention_tensors: frozenset[str]
 
     def selects_step(self, step: int) -> bool:
         return any(
@@ -62,11 +70,16 @@ class _DumpOptions:
         )
         phase = "all" if self.phases == _PHASES else ",".join(sorted(self.phases))
         ranks = "all" if self.ranks is None else ",".join(map(str, sorted(self.ranks)))
+        attention: str | None = None
+        if self.attention is not None:
+            attention = self.attention.pattern
         return {
             "steps": steps,
             "phase": phase,
             "max_steps": self.max_steps,
             "ranks": ranks,
+            "attention": attention,
+            "attention_tensors": ",".join(sorted(self.attention_tensors)),
         }
 
 
@@ -131,6 +144,28 @@ def _parse_ranks(value: str) -> frozenset[int] | None:
     return frozenset(ranks)
 
 
+def _parse_attention(value: str) -> re.Pattern[str] | None:
+    if not value:
+        return None
+    try:
+        return re.compile(value)
+    except re.error as error:
+        raise ValueError(
+            f"{_ATTENTION_ENV}={value!r} is not a regular expression: {error}"
+        ) from error
+
+
+def _parse_attention_tensors(value: str) -> frozenset[str]:
+    names = _items(_ATTENTION_TENSORS_ENV, value)
+    unknown = sorted(set(names) - _ATTENTION_TENSORS)
+    if unknown:
+        raise ValueError(
+            f"{_ATTENTION_TENSORS_ENV}={value!r}: {unknown} are not in "
+            f"{sorted(_ATTENTION_TENSORS)}"
+        )
+    return frozenset(names)
+
+
 def _options_from_environ(environ: Mapping[str, str]) -> _DumpOptions | None:
     """The dump options, or ``None`` when ``QUANT_SUITE_TENSOR_DUMP_DIR`` is
     unset or empty, in which case the other variables are ignored.
@@ -147,4 +182,8 @@ def _options_from_environ(environ: Mapping[str, str]) -> _DumpOptions | None:
         phases=_parse_phases(environ.get(_PHASE_ENV, "all")),
         max_steps=_parse_max_steps(environ.get(_MAX_STEPS_ENV, "1")),
         ranks=_parse_ranks(environ.get(_RANKS_ENV, "all")),
+        attention=_parse_attention(environ.get(_ATTENTION_ENV, "")),
+        attention_tensors=_parse_attention_tensors(
+            environ.get(_ATTENTION_TENSORS_ENV, "q,k,v,output")
+        ),
     )

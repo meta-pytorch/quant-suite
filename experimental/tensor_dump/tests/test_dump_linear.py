@@ -79,7 +79,7 @@ def _vllm_config(use_v2_model_runner: bool) -> SimpleNamespace:
     return SimpleNamespace(
         use_v2_model_runner=use_v2_model_runner,
         speculative_config=None,
-        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
     )
 
 
@@ -259,7 +259,7 @@ class DumpLinearTest(unittest.TestCase):
     def test_v1_model_runner_selected_by_config_starts(self) -> None:
         settings = _settings_from(_vllm_config(use_v2_model_runner=False), True)
         self.assertFalse(settings.v2_model_runner)
-        self.assertEqual(settings.max_num_seqs, 1)
+        self.assertFalse(settings.prefix_caching)
         with dump_session(self.directory, settings=settings) as forward:
             model = _model()
             _prefill(forward, model)

@@ -35,9 +35,6 @@ _EXAMPLE_RECIPE: dict[str, object] = {
         },
         ".*": {"activation": {"type": "dump", "tensors": ["input", "output"]}},
     },
-    "attention_recipe": {
-        ".*": {"q": {"type": "dump", "tensors": ["q", "k", "v", "output"]}},
-    },
 }
 
 
@@ -66,6 +63,7 @@ class DumpRecipeTest(unittest.TestCase):
         payloads = {
             "unknown key": {"type": "dump", "tensors": ["input"], "every": 2},
             "unknown tensor": {"type": "dump", "tensors": ["scores"]},
+            "attention tensor": {"type": "dump", "tensors": ["q"]},
             "duplicate": {"type": "dump", "tensors": ["input", "input"]},
             "empty list": {"type": "dump", "tensors": []},
             "bare string": {"type": "dump", "tensors": "input"},
@@ -81,8 +79,8 @@ class DumpRecipeTest(unittest.TestCase):
             RUNTIME.deserialize(recipe.to_dict()).to_dict(), recipe.to_dict()
         )
         self.assertEqual(
-            DumpRecipe(tensors=("q", "k")).to_dict(),
-            {"quantize": {"type": "dump", "tensors": ["k", "q"]}},
+            DumpRecipe(tensors=("output", "input")).to_dict(),
+            {"quantize": {"type": "dump", "tensors": ["input", "output"]}},
         )
 
     @unittest.skipUnless(
@@ -98,20 +96,18 @@ class DumpRecipeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             QuantRecipeRuntime().deserialize(_linear({"type": "dump"}))
 
-    def test_prepare_rejects_tensors_of_the_other_kind(self) -> None:
+    def test_attention_dump_stage_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "QUANT_SUITE_TENSOR_DUMP_ATTENTION"):
+            RUNTIME.deserialize({"attention_recipe": {".*": {"q": {"type": "dump"}}}})
         with dump_session(None):
-            with self.assertRaisesRegex(ValueError, "not valid for linear layers"):
-                RUNTIME.prepare_linear(
-                    QuantLinearRecipe(
-                        activation=PipelineRecipe([DumpRecipe(tensors=("q",))])
-                    )
-                )
-            with self.assertRaisesRegex(ValueError, "not valid for attention layers"):
+            with self.assertRaisesRegex(
+                ValueError, "QUANT_SUITE_TENSOR_DUMP_ATTENTION"
+            ):
                 RUNTIME.prepare_attention(
-                    QuantAttentionRecipe(
-                        q=PipelineRecipe([DumpRecipe(tensors=("input",))])
-                    )
+                    QuantAttentionRecipe(k=PipelineRecipe([DumpRecipe()]))
                 )
+        recipe = RUNTIME.deserialize({"attention_recipe": {".*": {}}})
+        self.assertTrue(recipe.has_attention_recipes())
 
     def test_prepare_rejects_two_dump_stages(self) -> None:
         recipe = QuantLinearRecipe(

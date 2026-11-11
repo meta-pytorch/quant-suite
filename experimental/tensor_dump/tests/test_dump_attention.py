@@ -4,85 +4,96 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""``DumpAttention`` at the ``bmm`` level, on operands laid out as the
-QuantSuite attention backend lays out one GQA request. CPU only."""
+"""Attention dumps from forward hooks on a stand-in for vLLM's ``Attention``
+layer. CPU only."""
 
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import torch
 from dump_test_utils import (
-    AttentionLayer,
     dump_session,
     fake_metadata,
+    FakeAttention,
+    generic_metadata,
     load,
     read_manifest,
 )
-from quant_suite_recipe.api import QuantizedTensor
-from quant_suite_recipe.definition import PipelineRecipe, QuantAttentionRecipe
-from quant_suite_recipe.runtime import QuantRecipeRuntime
-from tensor_dump._step import _VllmSettings
-from tensor_dump.recipe import DumpRecipe
+from quant_suite_recipe.definition import QuantLinearRecipe
+from tensor_dump._step import _settings_from, _VllmSettings
 from tensor_dump.runtime import RUNTIME
 
-_LAYER = "model.layers.0.self_attn.attn"
+_LAYERS = ("model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn")
 _HEADS = 8
 _KV_HEADS = 2
-_GROUP = _HEADS // _KV_HEADS
 _HEAD_SIZE = 16
+_WINDOW = 4
+_SOFT_CAP = 30.0
 
 
-def _expand(kv: torch.Tensor) -> torch.Tensor:
-    """``[L, Hkv, D]`` -> head-major ``[Hq, L, D]``, as the backend expands GQA."""
-    return kv.repeat_interleave(_GROUP, dim=1).transpose(0, 1).contiguous()
+class _Model(torch.nn.Module):
+    """Two attention layers, the second with a sliding window and a soft cap,
+    and a linear executor without a ``dump`` stage, whose construction starts
+    the dump session as in vLLM. The second layer is called with keywords."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.quantized_linear = RUNTIME.prepare_linear(QuantLinearRecipe())
+        self.layers = torch.nn.ModuleList(
+            [
+                FakeAttention(_LAYERS[0], _HEADS, _KV_HEADS, _HEAD_SIZE),
+                FakeAttention(
+                    _LAYERS[1],
+                    _HEADS,
+                    _KV_HEADS,
+                    _HEAD_SIZE,
+                    sliding_window=_WINDOW,
+                    logits_soft_cap=_SOFT_CAP,
+                ),
+            ]
+        )
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> list[torch.Tensor]:
+        first, second = self.layers
+        return [first(q, k, v), second(query=q, key=k, value=v)]
 
 
-def _attend(
-    executor: torch.nn.Module,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_start_pos: int,
-) -> torch.Tensor:
-    """One request's causal attention through ``executor.bmm``; ``[Hq, Lq, D]``."""
-    scores = executor.bmm(
-        QuantizedTensor(tensor=q.transpose(0, 1).contiguous()),
-        QuantizedTensor(tensor=_expand(k)),
-        transpose_right=True,
-        out_dtype=torch.float32,
-    )
-    scores *= _HEAD_SIZE**-0.5
-    causal = torch.arange(q.shape[0])[:, None] + q_start_pos >= torch.arange(k.shape[0])
-    scores.masked_fill_(~causal, float("-inf"))
-    weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-    return executor.bmm(
-        QuantizedTensor(tensor=weights), QuantizedTensor(tensor=_expand(v))
-    )
-
-
-def _inputs(q_len: int, kv_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _inputs(tokens: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Q, K and V of ``tokens`` new tokens, as vLLM passes them to the layer."""
     return (
-        torch.randn(q_len, _HEADS, _HEAD_SIZE, dtype=torch.bfloat16),
-        torch.randn(kv_len, _KV_HEADS, _HEAD_SIZE, dtype=torch.bfloat16),
-        torch.randn(kv_len, _KV_HEADS, _HEAD_SIZE, dtype=torch.bfloat16),
+        torch.randn(tokens, _HEADS * _HEAD_SIZE, dtype=torch.bfloat16),
+        torch.randn(tokens, _KV_HEADS * _HEAD_SIZE, dtype=torch.bfloat16),
+        torch.randn(tokens, _KV_HEADS * _HEAD_SIZE, dtype=torch.bfloat16),
     )
 
 
-def _layer(micro_batch_size: int | None = None) -> AttentionLayer:
-    recipe = QuantAttentionRecipe(q=PipelineRecipe([DumpRecipe()]))
-    return AttentionLayer(
-        RUNTIME.prepare_attention(recipe),
-        _LAYER,
-        _HEADS,
-        _KV_HEADS,
-        _HEAD_SIZE,
-        micro_batch_size,
-    )
+def _run(
+    forward: Any,
+    model: _Model,
+    q_lens: list[int],
+    q_starts: list[int],
+) -> tuple[tuple[torch.Tensor, ...], list[torch.Tensor]]:
+    """One forward of ``model``; returns its inputs and outputs."""
+    forward.real({name: generic_metadata(q_lens, q_starts) for name in _LAYERS})
+    inputs = _inputs(sum(q_lens))
+    return inputs, model(*inputs)
 
 
-def _attention_records(directory: Path) -> list[dict[str, object]]:
-    return [r for r in read_manifest(directory) if r["record"] == "attention"]
+def _records(directory: Path, layer: str | None = None) -> list[dict[str, Any]]:
+    return [
+        r
+        for r in read_manifest(directory)
+        if r["record"] == "attention" and (layer is None or r["layer"] == layer)
+    ]
+
+
+def _heads(tensor: torch.Tensor, heads: int) -> torch.Tensor:
+    return tensor.reshape(tensor.shape[0], heads, _HEAD_SIZE)
 
 
 class DumpAttentionTest(unittest.TestCase):
@@ -90,172 +101,222 @@ class DumpAttentionTest(unittest.TestCase):
         torch.manual_seed(0)
         self.directory = Path(tempfile.mkdtemp())
 
-    def _check_files(self, phase: str, q_len: int, q_start_pos: int) -> None:
-        kv_len = q_len + q_start_pos
-        q, k, v = _inputs(q_len, kv_len)
-        with dump_session(self.directory) as forward:
-            layer = _layer()
-            forward.real({_LAYER: fake_metadata([q_len], [q_start_pos])})
-            output = layer(lambda e: _attend(e, q, k, v, q_start_pos))
-        (record,) = [
-            r for r in read_manifest(self.directory) if r["record"] == "attention"
-        ]
-        self.assertEqual(record["phase"], phase)
-        expected = {"q": q, "k": k, "v": v, "output": output.transpose(0, 1)}
-        self.assertEqual(sorted(record["tensors"]), sorted(expected))
-        for tensor, entry in record["tensors"].items():
-            saved = load(self.directory, entry)
-            self.assertTrue(torch.equal(saved, expected[tensor]), tensor)
-            self.assertEqual(entry["shape"], list(expected[tensor].shape))
-        replay = record["replay"]
-        self.assertEqual(
-            (replay["q_len"], replay["kv_len"], replay["q_start_pos"]),
-            (q_len, kv_len, q_start_pos),
-        )
-        self.assertEqual(replay["gqa_group"], _GROUP)
-        self.assertEqual(replay["softmax_scale"], _HEAD_SIZE**-0.5)
-        self.assertEqual(replay["dtype"], "bfloat16")
-
-    def test_prefill_files_are_unpadded_unexpanded_nhd(self) -> None:
-        self._check_files("prefill", q_len=5, q_start_pos=0)
-
-    def test_decode_files_are_unpadded_unexpanded_nhd(self) -> None:
-        self._check_files("decode", q_len=1, q_start_pos=5)
-
-    def test_bmm_results_equal_base_executor(self) -> None:
-        q, k, v = _inputs(4, 4)
-        base = QuantRecipeRuntime().prepare_attention(QuantAttentionRecipe())
-        expected = _attend(base, q, k, v, 0)
-        with dump_session(self.directory) as forward:
-            layer = _layer()
-            forward.real({_LAYER: fake_metadata([4], [0])})
-            output = layer(lambda e: _attend(e, q, k, v, 0))
-        self.assertTrue(torch.equal(output, expected))
-
-    def test_requests_of_one_step_map_to_their_files(self) -> None:
-        q0, k0, v0 = _inputs(3, 3)
-        q1, k1, v1 = _inputs(1, 5)
-        with dump_session(self.directory) as forward:
-            layer = _layer()
-            forward.real({_LAYER: fake_metadata([3, 1], [0, 4])})
-            output = layer(
-                lambda e: torch.cat(
-                    [_attend(e, q0, k0, v0, 0), _attend(e, q1, k1, v1, 4)], dim=1
-                )
-            )
-        records = _attention_records(self.directory)
-        self.assertEqual([r["request"] for r in records], [0, 1])
-        outputs = output.transpose(0, 1).split([3, 1])
-        sources = [(q0, k0, v0, outputs[0]), (q1, k1, v1, outputs[1])]
-        for record, (q, k, v, out) in zip(records, sources):
-            index = record["request"]
-            with self.subTest(request=index):
-                replay = record["replay"]
-                self.assertEqual(
-                    (replay["q_len"], replay["kv_len"], replay["q_start_pos"]),
-                    ((3, 3, 0), (1, 5, 4))[index],
-                )
-                expected = {"q": q, "k": k, "v": v, "output": out}
-                for name, entry in record["tensors"].items():
-                    self.assertTrue(
-                        entry["file"].endswith(f"/req{index:03d}.{name}.pt")
-                    )
-                    self.assertTrue(
-                        torch.equal(load(self.directory, entry), expected[name]), name
-                    )
-
-    def test_prefill_then_decode_on_one_layer(self) -> None:
-        q0, k0, v0 = _inputs(4, 4)
-        q1, k1, v1 = _inputs(1, 5)
-        with dump_session(self.directory, MAX_STEPS="2") as forward:
-            layer = _layer()
-            forward.real({_LAYER: fake_metadata([4], [0])})
-            layer(lambda e: _attend(e, q0, k0, v0, 0))
-            forward.real({_LAYER: fake_metadata([1], [4])})
-            layer(lambda e: _attend(e, q1, k1, v1, 4))
-        records = _attention_records(self.directory)
-        self.assertEqual(
-            [(r["step"], r["request"], r["phase"]) for r in records],
-            [(0, 0, "prefill"), (1, 0, "decode")],
-        )
-        decode_q = records[1]["tensors"]["q"]
-        self.assertEqual(decode_q["file"], f"step_000001/{_LAYER}/req000.q.pt")
-        self.assertTrue(torch.equal(load(self.directory, decode_q), q1))
-        self.assertTrue(
-            torch.equal(load(self.directory, records[1]["tensors"]["k"]), k1)
-        )
-
-    def test_batched_products_raise_at_bind(self) -> None:
-        # Binding happens at the first forward, even a dummy one.
-        with dump_session(self.directory) as forward:
-            layer = _layer(micro_batch_size=8)
-            forward.dummy()
-            with self.assertRaisesRegex(
-                RuntimeError, "QUANT_SUITE_MHA_MICRO_BATCH_SIZE=1"
-            ):
-                layer(lambda e: torch.zeros(1))
-
-    def test_single_request_products_bind(self) -> None:
-        cases = {
-            "micro_batch_size=1": (1, _VllmSettings()),
-            "max_num_seqs=1": (8, _VllmSettings(max_num_seqs=1)),
+    def test_files_and_replay_fields(self) -> None:
+        with dump_session(self.directory, ATTENTION=".*") as forward:
+            model = _Model()
+            (q, k, v), outputs = _run(forward, model, [5], [0])
+        manifest = read_manifest(self.directory)
+        self.assertEqual(manifest[0]["format_version"], 2)
+        self.assertEqual(manifest[0]["options"]["attention"], ".*")
+        self.assertEqual([r for r in manifest if r["record"] == "linear"], [])
+        expected = {
+            "q": _heads(q, _HEADS),
+            "k": _heads(k, _KV_HEADS),
+            "v": _heads(v, _KV_HEADS),
         }
-        for name, (micro_batch_size, settings) in cases.items():
+        for layer, output, window, soft_cap in zip(
+            _LAYERS, outputs, (None, _WINDOW), (None, _SOFT_CAP)
+        ):
+            with self.subTest(layer=layer):
+                (record,) = _records(self.directory, layer)
+                self.assertEqual(record["phase"], "prefill")
+                tensors = {**expected, "output": _heads(output, _HEADS)}
+                self.assertEqual(sorted(record["tensors"]), sorted(tensors))
+                for name, entry in record["tensors"].items():
+                    self.assertEqual(
+                        entry["file"], f"step_000000/{layer}/req000.{name}.pt"
+                    )
+                    self.assertTrue(
+                        torch.equal(load(self.directory, entry), tensors[name]), name
+                    )
+                self.assertEqual(
+                    record["replay"],
+                    {
+                        "q_start_pos": 0,
+                        "q_len": 5,
+                        "kv_len": 5,
+                        "kv_rows": [0, 5],
+                        "causal": True,
+                        "scale": _HEAD_SIZE**-0.5,
+                        "sliding_window": window,
+                        "logits_soft_cap": soft_cap,
+                        "num_q_heads": _HEADS,
+                        "num_kv_heads": _KV_HEADS,
+                        "head_size": _HEAD_SIZE,
+                        "head_size_v": _HEAD_SIZE,
+                        "layout": "NHD",
+                        "dtype": "bfloat16",
+                        "kv_cache_dtype": "auto",
+                        "backend": "FAKE",
+                    },
+                )
+
+    def test_outputs_are_unchanged(self) -> None:
+        q, k, v = _inputs(3)
+        with dump_session(None):
+            expected = _Model()(q, k, v)
+        with dump_session(self.directory, ATTENTION=".*") as forward:
+            model = _Model()
+            forward.real({name: generic_metadata([3], [0]) for name in _LAYERS})
+            outputs = model(q, k, v)
+        for output, reference in zip(outputs, expected):
+            self.assertTrue(torch.equal(output, reference))
+        self.assertEqual(len(_records(self.directory)), 2)
+
+    def test_requests_of_one_step_map_to_their_rows(self) -> None:
+        with dump_session(self.directory, ATTENTION=_LAYERS[0]) as forward:
+            model = _Model()
+            (q, k, _), (output, _) = _run(forward, model, [3, 1], [0, 4])
+        records = _records(self.directory)
+        self.assertEqual([r["request"] for r in records], [0, 1])
+        for record, rows, replay in zip(
+            records, (slice(0, 3), slice(3, 4)), ((0, 3, 3), (4, 1, 5))
+        ):
+            with self.subTest(request=record["request"]):
+                r = record["replay"]
+                self.assertEqual((r["q_start_pos"], r["q_len"], r["kv_len"]), replay)
+                self.assertEqual(r["kv_rows"], [replay[0], replay[2]])
+                tensors = record["tensors"]
+                self.assertTrue(
+                    torch.equal(
+                        load(self.directory, tensors["q"]), _heads(q[rows], _HEADS)
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load(self.directory, tensors["k"]),
+                        _heads(k[rows], _KV_HEADS),
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load(self.directory, tensors["output"]),
+                        _heads(output[rows], _HEADS),
+                    )
+                )
+
+    def test_chunked_prefill_then_decode_hold_new_rows_only(self) -> None:
+        steps = [([4], [0]), ([2], [4]), ([1], [6])]
+        with dump_session(self.directory, ATTENTION=_LAYERS[0], MAX_STEPS="0") as f:
+            model = _Model()
+            keys = [
+                _run(f, model, q_lens, q_starts)[0][1] for q_lens, q_starts in steps
+            ]
+        records = _records(self.directory)
+        self.assertEqual(
+            [(r["step"], r["phase"], r["replay"]["kv_rows"]) for r in records],
+            [(0, "prefill", [0, 4]), (1, "prefill", [4, 6]), (2, "decode", [6, 7])],
+        )
+        self.assertEqual(
+            [(r["replay"]["q_start_pos"], r["replay"]["kv_len"]) for r in records],
+            [(0, 4), (4, 6), (6, 7)],
+        )
+        history = torch.cat(
+            [load(self.directory, r["tensors"]["k"]) for r in records], dim=0
+        )
+        self.assertTrue(torch.equal(history, _heads(torch.cat(keys), _KV_HEADS)))
+
+    def test_backend_metadata_fields_are_used(self) -> None:
+        # Metadata with decode offsets and a padded token count, as some
+        # backends provide.
+        with dump_session(self.directory, ATTENTION=_LAYERS[0]) as forward:
+            model = _Model()
+            forward.real({name: fake_metadata([2, 1], [0, 3]) for name in _LAYERS})
+            model(*_inputs(4))
+        self.assertEqual(
+            [r["replay"]["kv_rows"] for r in _records(self.directory)],
+            [[0, 2], [3, 4]],
+        )
+
+    def test_selection_by_pattern_and_tensors(self) -> None:
+        with dump_session(
+            self.directory,
+            ATTENTION=r"model\.layers\.1\.",
+            ATTENTION_TENSORS="output, q",
+        ) as forward:
+            model = _Model()
+            _run(forward, model, [2], [0])
+        (record,) = _records(self.directory)
+        self.assertEqual(record["layer"], _LAYERS[1])
+        self.assertEqual(sorted(record["tensors"]), ["output", "q"])
+
+    def test_unset_pattern_hooks_no_layer(self) -> None:
+        with dump_session(self.directory) as forward:
+            model = _Model()
+            _run(forward, model, [2], [0])
+            self.assertEqual(
+                [len(layer._forward_hooks) for layer in model.layers], [0, 0]
+            )
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_dummy_forward_writes_nothing(self) -> None:
+        with dump_session(self.directory, ATTENTION=".*") as forward:
+            model = _Model()
+            forward.dummy()
+            model(*_inputs(3))
+            self.assertEqual(list(self.directory.iterdir()), [])
+            _run(forward, model, [3], [0])
+        self.assertEqual(
+            sorted({r["step"] for r in _records(self.directory)}),
+            [0],
+        )
+
+    def test_unsupported_layers_raise_at_first_forward(self) -> None:
+        class Subclass(FakeAttention):
+            pass
+
+        def alibi(layer: Any) -> None:
+            layer.impl.alibi_slopes = [1.0]
+
+        def sinks(layer: Any) -> None:
+            layer.has_sink = True
+
+        def shared_kv(layer: Any) -> None:
+            layer.kv_sharing_target_layer_name = "model.layers.0.self_attn.attn"
+
+        def encoder(layer: Any) -> None:
+            layer.attn_type = "encoder_only"
+
+        cases = {
+            "alibi": alibi,
+            "sinks": sinks,
+            "kv sharing": shared_kv,
+            "encoder": encoder,
+        }
+        for name, change in cases.items():
             with self.subTest(case=name):
-                with dump_session(self.directory, settings=settings) as forward:
-                    layer = _layer(micro_batch_size=micro_batch_size)
-                    forward.dummy()
-                    self.assertEqual(layer(lambda e: torch.ones(1)).item(), 1.0)
-                    self.assertIsNotNone(layer.quantized_attention._layout)
+                with dump_session(Path(tempfile.mkdtemp()), ATTENTION=".*") as forward:
+                    model = _Model()
+                    change(model.layers[1])
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "QUANT_SUITE_TENSOR_DUMP_ATTENTION"
+                    ):
+                        _run(forward, model, [2], [0])
+        with self.subTest(case="subclass"):
+            with dump_session(Path(tempfile.mkdtemp()), ATTENTION=".*") as forward:
+                model = _Model()
+                model.layers[1] = Subclass(_LAYERS[1], _HEADS, _KV_HEADS, _HEAD_SIZE)
+                with self.assertRaisesRegex(NotImplementedError, "Subclass"):
+                    _run(forward, model, [2], [0])
 
-    def test_two_requests_in_one_product_raise(self) -> None:
-        q, k, _ = _inputs(3, 3)
-        q_operand = q.transpose(0, 1).repeat(2, 1, 1)
-        k_operand = _expand(k).repeat(2, 1, 1)
-        with dump_session(self.directory) as forward:
-            layer = _layer()
-            forward.real({_LAYER: fake_metadata([3, 3], [0, 0])})
-            with self.assertRaisesRegex(
-                RuntimeError, "QUANT_SUITE_MHA_MICRO_BATCH_SIZE"
-            ):
-                layer(
-                    lambda e: e.bmm(
-                        QuantizedTensor(tensor=q_operand),
-                        QuantizedTensor(tensor=k_operand),
-                        transpose_right=True,
-                        out_dtype=torch.float32,
-                    )
-                )
+    def test_prefix_caching_raises_when_attention_is_selected(self) -> None:
+        settings = _VllmSettings(prefix_caching=True)
+        with dump_session(self.directory, settings=settings, ATTENTION=".*"):
+            with self.assertRaisesRegex(RuntimeError, "--no-enable-prefix-caching"):
+                _Model()
+        with dump_session(self.directory, settings=settings) as forward:
+            _run(forward, _Model(), [2], [0])
+        self.assertEqual(list(self.directory.iterdir()), [])
 
-    def test_pv_without_qk_raises(self) -> None:
-        _, _, v = _inputs(3, 3)
-        weights = torch.rand(_HEADS, 3, 3, dtype=torch.bfloat16)
-        with dump_session(self.directory) as forward:
-            layer = _layer()
-            forward.real({_LAYER: fake_metadata([3], [0])})
-            with self.assertRaisesRegex(RuntimeError, "without Q @ K"):
-                layer(
-                    lambda e: e.bmm(
-                        QuantizedTensor(tensor=weights),
-                        QuantizedTensor(tensor=_expand(v)),
-                    )
-                )
-
-    def test_ungrouped_kv_heads_raise(self) -> None:
-        q, _, _ = _inputs(3, 3)
-        k_operand = torch.randn(_HEADS, 3, _HEAD_SIZE, dtype=torch.bfloat16)
-        with dump_session(self.directory) as forward:
-            layer = _layer()
-            forward.real({_LAYER: fake_metadata([3], [0])})
-            with self.assertRaisesRegex(RuntimeError, "does not repeat each KV head"):
-                layer(
-                    lambda e: e.bmm(
-                        QuantizedTensor(tensor=q.transpose(0, 1).contiguous()),
-                        QuantizedTensor(tensor=k_operand),
-                        transpose_right=True,
-                        out_dtype=torch.float32,
-                    )
-                )
+    def test_prefix_caching_is_read_from_the_config(self) -> None:
+        for enabled in (True, False):
+            config = SimpleNamespace(
+                use_v2_model_runner=False,
+                speculative_config=None,
+                cache_config=SimpleNamespace(enable_prefix_caching=enabled),
+            )
+            self.assertEqual(_settings_from(config, None).prefix_caching, enabled)
+        self.assertIsNone(_settings_from(None, None).prefix_caching)
 
 
 if __name__ == "__main__":

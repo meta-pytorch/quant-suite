@@ -74,13 +74,13 @@ class _VllmSettings:
         v2_model_runner: Whether vLLM's V2 model runner is enabled.
         speculative: Whether speculative decoding is configured; ``None`` when
             no vLLM config is current.
-        max_num_seqs: The scheduler's request limit per step; ``None`` when no
-            vLLM config is current.
+        prefix_caching: Whether vLLM's prefix caching is enabled; ``None`` when
+            no vLLM config is current.
     """
 
     v2_model_runner: bool = False
     speculative: bool | None = None
-    max_num_seqs: int | None = None
+    prefix_caching: bool | None = None
 
 
 def _forward_context() -> Any | None:
@@ -110,7 +110,7 @@ def _settings_from(config: Any | None, v2_env: bool | None) -> _VllmSettings:
     return _VllmSettings(
         v2_model_runner=bool(getattr(config, "use_v2_model_runner", v2_env is True)),
         speculative=config.speculative_config is not None,
-        max_num_seqs=int(config.scheduler_config.max_num_seqs),
+        prefix_caching=bool(config.cache_config.enable_prefix_caching),
     )
 
 
@@ -203,18 +203,18 @@ class _StepTracker:
 
     Args:
         options: The dump options.
-        on_first_step: Called once, at the first real forward.
+        on_step: Called with the step id at the start of every real forward.
         on_selected_step: Called at the start of every step that is written.
     """
 
     def __init__(
         self,
         options: _DumpOptions,
-        on_first_step: Callable[[], None],
+        on_step: Callable[[int], None],
         on_selected_step: Callable[[_StepInfo], None],
     ) -> None:
         self._options = options
-        self._on_first_step = on_first_step
+        self._on_step = on_step
         self._on_selected_step = on_selected_step
         # Keyed by id() and checked against a weak reference, since vLLM's
         # forward contexts are not hashable.
@@ -297,7 +297,7 @@ class _StepTracker:
         self._next_step += 1
         if self._rank is None:
             self._rank = _distributed_rank()[0]
-            self._on_first_step()
+        self._on_step(step)
         unselected = _StepInfo(step, "", False, (), 0)
         if not (
             self._options.selects_step(step) and self._options.selects_rank(self._rank)

@@ -6,9 +6,9 @@
 
 """The ``dump`` tensor recipe type and its identity handler.
 
-A ``dump`` stage leaves its tensor unchanged. Its presence in a module recipe
-marks the module for dumping, and its ``tensors`` option selects what the
-module writes::
+A ``dump`` stage leaves its tensor unchanged. Its presence in a linear
+recipe marks the layer for dumping, and its ``tensors`` option selects what the
+layer writes::
 
     linear_recipe:
       '.*':
@@ -28,19 +28,15 @@ from quant_suite_recipe.api import QuantizedTensor, QuantTensorRecipe
 
 _LINEAR_TENSORS: frozenset[str] = frozenset({"input", "weight", "output"})
 
-_ATTENTION_TENSORS: frozenset[str] = frozenset({"q", "k", "v", "output"})
-
 _KEYS: frozenset[str] = frozenset({"type", "tensors"})
 
 
 @dataclass
 class DumpRecipe(QuantTensorRecipe):
-    """Identity stage that marks its module for dumping.
+    """Identity stage that marks its linear layer for dumping.
 
-    ``tensors`` lists the tensors to write: ``input``, ``weight`` and ``output``
-    for a linear module, ``q``, ``k``, ``v`` and ``output`` for an attention
-    module; ``None`` writes every tensor of the module's kind. The names are
-    stored sorted.
+    ``tensors`` lists the tensors to write, from ``input``, ``weight`` and
+    ``output``; ``None`` writes all three. The names are stored sorted.
     """
 
     discriminator: ClassVar[str] = "dump"
@@ -63,11 +59,11 @@ class DumpRecipe(QuantTensorRecipe):
         )
         if duplicates:
             raise ValueError(f"DumpRecipe.tensors repeats {duplicates}")
-        unknown = sorted(set(self.tensors) - _LINEAR_TENSORS - _ATTENTION_TENSORS)
+        unknown = sorted(set(self.tensors) - _LINEAR_TENSORS)
         if unknown:
             raise ValueError(
                 f"DumpRecipe.tensors has unknown names {unknown}; expected names "
-                f"from {sorted(_LINEAR_TENSORS | _ATTENTION_TENSORS)}"
+                f"from {sorted(_LINEAR_TENSORS)}"
             )
         self.tensors = tuple(sorted(self.tensors))
 

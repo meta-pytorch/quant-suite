@@ -4,41 +4,50 @@
 > [`../README.md`](../README.md).
 
 `tensor_dump` (distribution `quant_suite_tensor_dump`) records the operands and
-results of the matrix multiplications in a QuantSuite model's linear and
-attention layers while vLLM runs it, so they can be analysed offline. The
+results of a QuantSuite model's linear layers, and the inputs and output of its
+attention layers, while vLLM runs it, so they can be analysed offline. The
 attention records hold everything needed to recompute the attention output,
 so the recorded Q, K and V can be replayed through other attention
 implementations and their outputs compared against the recorded one.
 
-Like every experimental package it goes through the public extension points of
-`quant_suite_recipe` only: a tensor recipe type, `dump`, and the executor
-classes of the package's recipe runtime.
+Linear layers go through the public extension points of `quant_suite_recipe`
+only: a tensor recipe type, `dump`, and the linear executor of the package's
+recipe runtime. Attention layers are recorded by forward hooks on vLLM's
+`Attention` layer, which capture the same tensors under every attention
+backend; recording needs a backend whose metadata describes the step's
+requests (see [Environment variables](#environment-variables)).
 
 ## What is recorded
 
 | layer | tensors | taken from |
 | --- | --- | --- |
 | linear | `input`, `weight`, `output` | the executor's `forward`: the raw activation, the registered weight (and bias), and the layer output including the bias |
-| attention | `q`, `k`, `v`, `output` | the two attention products: `Q @ K^T` gives Q and K, `P @ V` gives V and the attention output |
+| attention | `q`, `k`, `v`, `output` | a forward hook on vLLM's `Attention` layer: its `query`, `key` and `value` arguments, and the output it returns |
 
 A recipe that only marks layers for dumping changes no value: the `dump` stage
 returns its input unchanged and the executors compute exactly what the
-built-in ones compute. With a `fake` stage beside it, the recorded attention
-operands are the fake-quantized ones the products see.
+built-in ones compute. The attention hooks only read.
 
 - Linear rows cover the tokens of the step.
 - Attention is recorded per request, unpadded. K and V have one head per KV
-  head, not one per query head, and hold the request's whole context: the
-  cached tokens and the step's new ones.
-- Q and K are taken after the rotary embedding.
+  head, not one per query head, and hold **only the step's new tokens**: rows
+  `[q_start_pos, kv_len)` of the request's keys and values. A request's full
+  keys and values at a step are the concatenation of its rows from every step
+  up to that one.
+- Q and K are what the model passes to the attention layer: after any rotary
+  embedding, QK norm and query pre-scale. The output is the attention layer's,
+  before anything the model applies after it, such as an output gate.
+- Q, K and V are taken before any quantization inside the attention backend,
+  such as an FP8 KV cache; `kv_cache_dtype` in the record says which.
 - Each tensor is the shard of the rank that writes it. A row-parallel linear
   layer's output is the partial sum before the all-reduce.
 
 ## The dump recipe
 
-The `dump` tensor recipe type marks a module for dumping. Its `tensors` option
-selects what the module writes; leave it out to write every tensor of the
-module's kind. Recipe patterns select the layers, as for any recipe:
+The `dump` tensor recipe type marks a linear layer for dumping. Its `tensors`
+option selects what the layer writes, from `input`, `weight` and `output`;
+leave it out to write all three. Recipe patterns select the layers, as for any
+recipe:
 
 ```yaml
 linear_recipe:
@@ -50,26 +59,22 @@ linear_recipe:
     activation:
       type: dump
       tensors: [input, output]
-
-attention_recipe:
-  '.*':
-    q:
-      type: dump
-      tensors: [q, k, v, output]
 ```
 
 This is
 [`examples/llama_3_1_8b_instruct/dump_bf16.yaml`](examples/llama_3_1_8b_instruct/dump_bf16.yaml).
-The stage can go in any pipeline slot of the module; `activation` and `q` are
-the convention. A module recipe holds at most one `dump` stage, and its
-`tensors` must belong to the module's kind (`input`, `weight`, `output` for
-linear; `q`, `k`, `v`, `output` for attention), which is checked when the
-layer's executor is built.
+The stage can go in any pipeline slot of the layer; `activation` is the
+convention. A linear recipe holds at most one `dump` stage, which is checked
+when the layer's executor is built.
 
-Both sections are needed even for a model with no quantization: without
-`linear_recipe` or `attention_recipe`, the QuantSuite vLLM plugin does not
-attach to those layers. `lm_head` and the embedding are not QuantSuite layers
-and are never recorded.
+Attention layers are not selected by the recipe: a `dump` stage in
+`attention_recipe` is an error that names the environment variables below.
+
+The recipe needs a `linear_recipe` section, even when no linear layer is
+dumped (`'.*': {}` then): without it the QuantSuite vLLM plugin does not attach
+to the linear layers, and building the first linear executor is what starts
+the dump session, attention hooks included. `attention_recipe` is not needed.
+`lm_head` and the embedding are not QuantSuite layers and are never recorded.
 
 The weight of a layer is written once, at the first step the layer writes.
 Writing every weight of a model is as large as its checkpoint, so the example
@@ -84,6 +89,8 @@ selects the weights of one decoder layer only.
 | `QUANT_SUITE_TENSOR_DUMP_PHASE` | `all` | Step phases that may be written: a comma list of `prefill`, `decode`, `mixed`, or `all`. |
 | `QUANT_SUITE_TENSOR_DUMP_MAX_STEPS` | `1` | At most this many steps are written, counting steps that pass the other filters; `0` means no cap. |
 | `QUANT_SUITE_TENSOR_DUMP_RANKS` | `all` | Comma list of the global ranks that write. |
+| `QUANT_SUITE_TENSOR_DUMP_ATTENTION` | unset | Regular expression over vLLM's attention layer names (`Attention.layer_name`, e.g. `model.layers.0.self_attn.attn`), matched with `re.match` like recipe patterns. Unset or empty records no attention layer. |
+| `QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS` | `q,k,v,output` | Comma list of the tensors each selected attention layer writes. |
 | `VLLM_USE_V2_MODEL_RUNNER` | set by vLLM | Must be `0` while dumping: the V2 model runner's warmup forwards cannot be told apart from requests, so the dump refuses to start under it. |
 
 A step is one model forward. Step ids count the forwards of a process from 0;
@@ -95,8 +102,14 @@ with `VLLM_USE_V2_MODEL_RUNNER=0`, which selects the V1 runner. All ranks of a t
 forwards, so their step ids agree; ranks that do not write still count steps.
 
 The requests of a step come from the attention metadata's `query_start_loc`
-and `seq_lens`, which every vLLM attention backend provides, so linear layers
-can be recorded with any attention backend.
+and `seq_lens`, so recording either kind of layer needs an attention backend
+whose metadata has both: vLLM's `FLASH_ATTN`, `TRITON_ATTN`, `FLEX_ATTENTION`,
+`ROCM_ATTN` and `CPU_ATTN`. `FLASHINFER` is not supported: the dump raises at
+the first step under it. vLLM selects `FLASHINFER` by default on GPUs of
+compute capability 10.x; choose another backend with
+`--attention-backend FLASH_ATTN`. An attention layer reads its own metadata
+entry; `q_start_pos` is `kv_len - q_len`. Linear and attention records share
+the step ids, and attention can be recorded without any linear `dump` stage.
 
 A request is `decode` when it has one query token after position 0, and
 `prefill` otherwise, including chunked-prefill chunks. A step is `prefill` or
@@ -121,14 +134,15 @@ $QUANT_SUITE_TENSOR_DUMP_DIR/
 ```
 
 Each `.pt` file holds one tensor, saved with `torch.save`. Layer directories
-use the layer name verbatim. A manifest that already exists is an error, so
+use the layer name verbatim: the linear layer's prefix, and vLLM's
+`layer_name` for attention. A manifest that already exists is an error, so
 two runs never mix: use a new directory for each run.
 
 `manifest.jsonl` indexes the files, one JSON object per line; read it rather
 than parsing paths. Every path is relative to `rank_<R>/`.
 
-- `run`: written first. `format_version`, `rank`, `world_size`, `tp_rank`,
-  `tp_size`, `options` and `torch_version`.
+- `run`: written first. `format_version` (2), `rank`, `world_size`,
+  `tp_rank`, `tp_size`, `options` and `torch_version`.
 - `step`: one per written step. `step`, `phase`, `num_actual_tokens`, and
   `requests`, each with `request` (its index in the step's batch), `q_len`,
   `kv_len`, `q_start_pos`, `token_start` (its first row in the linear tensors)
@@ -141,20 +155,28 @@ than parsing paths. Every path is relative to `rank_<R>/`.
 
 | `replay` field | value |
 | --- | --- |
-| `q_len`, `kv_len` | query tokens, and keys and values attended |
-| `q_start_pos` | absolute position of the first query; always `kv_len - q_len` |
-| `causal`, `causal_alignment` | `true`, `"bottom_right"`: query `i` attends to keys `0 .. q_start_pos + i` |
-| `softmax_scale` | the scale applied to `Q @ K^T` |
-| `num_q_heads`, `num_kv_heads`, `head_dim`, `gqa_group` | per-rank head counts; query head `h` uses KV head `h // gqa_group` |
-| `sliding_window`, `logits_soft_cap`, `alibi` | `null` |
-| `layout` | `"NHD"`: Q and the output are `[q_len, num_q_heads, head_dim]`, K and V are `[kv_len, num_kv_heads, head_dim]` |
-| `dtype` | dtype of the tensors |
-| `rope_applied` | `true` |
-| `reference` | how the recorded output was computed: `Q @ K^T` accumulated and softmax taken in `float32`, `P @ V` with P in `dtype` |
+| `q_start_pos` | absolute position of the first query, which is also the first of the new rows in K and V; always `kv_len - q_len` |
+| `q_len`, `kv_len` | the request's query tokens in this step, and the keys and values it attends to, cached and new |
+| `kv_rows` | `[q_start_pos, kv_len]`: the half-open range of the request's full keys and values that `k` and `v` hold |
+| `causal` | `true`: query `i` attends to keys `0 .. q_start_pos + i` |
+| `scale` | the softmax scale applied to `Q @ K^T` (`impl.scale` of the layer) |
+| `sliding_window` | vLLM's window `W` of the layer (`Attention.sliding_window`), or `null` for full attention. Query `i` attends to keys `q_start_pos + i - W + 1 .. q_start_pos + i`, `W` keys including its own; FlashAttention's `window_size` is `(W - 1, 0)` |
+| `logits_soft_cap` | the layer's soft cap on `Q @ K^T`, or `null` for none |
+| `num_q_heads`, `num_kv_heads` | per-rank head counts; query head `h` uses KV head `h // (num_q_heads // num_kv_heads)` |
+| `head_size`, `head_size_v` | head size of Q and K, and of V and the output |
+| `layout` | `"NHD"`: Q and the output are `[q_len, num_q_heads, head_size]`, K and V are `[q_len, num_kv_heads, head_size]` |
+| `dtype` | dtype of Q as passed to the layer |
+| `kv_cache_dtype` | vLLM's KV-cache dtype setting of the layer (`auto` means unquantized) |
+| `backend` | vLLM's name for the attention backend that computed the output, e.g. `FLASH_ATTN` |
 
 `tensors` lists only the tensors that were written.
 
 ### Replaying an attention record
+
+`k` and `v` of one record hold only that step's new rows, so the full keys and
+values of a request are rebuilt from its records at this step and the steps
+before. With one request per step, they are the records of the same layer
+from the request's first step (`q_start_pos == 0`) on:
 
 ```python
 import json
@@ -165,26 +187,33 @@ import torch.nn.functional as F
 
 root = Path("/tmp/llama31_8b_dump/rank_0")
 records = [json.loads(line) for line in (root / "manifest.jsonl").open()]
-record = next(r for r in records if r["record"] == "attention")
+layer = "model.layers.0.self_attn.attn"
+history = [r for r in records if r["record"] == "attention" and r["layer"] == layer]
+record = history[-1]
 replay = record["replay"]
-q, k, v, expected = (
-    torch.load(root / record["tensors"][name]["file"]).float()
-    for name in ("q", "k", "v", "output")
-)
+first = max(i for i, r in enumerate(history) if r["replay"]["q_start_pos"] == 0)
 
-group = replay["gqa_group"]
-k = k.repeat_interleave(group, dim=1)  # one KV head per query head
-v = v.repeat_interleave(group, dim=1)
-causal = (
-    torch.arange(replay["q_len"])[:, None] + replay["q_start_pos"]
-    >= torch.arange(replay["kv_len"])
-)
+
+def load(r, name):
+    return torch.load(root / r["tensors"][name]["file"]).float()
+
+
+k = torch.cat([load(r, "k") for r in history[first:]])
+v = torch.cat([load(r, "v") for r in history[first:]])
+q, expected = load(record, "q"), load(record, "output")
+
+group = replay["num_q_heads"] // replay["num_kv_heads"]
+query_pos = torch.arange(replay["q_len"])[:, None] + replay["q_start_pos"]
+key_pos = torch.arange(replay["kv_len"])
+mask = key_pos <= query_pos
+if replay["sliding_window"] is not None:
+    mask &= key_pos > query_pos - replay["sliding_window"]
 output = F.scaled_dot_product_attention(
     q.transpose(0, 1),
-    k.transpose(0, 1),
-    v.transpose(0, 1),
-    attn_mask=causal,
-    scale=replay["softmax_scale"],
+    k.repeat_interleave(group, dim=1).transpose(0, 1),
+    v.repeat_interleave(group, dim=1).transpose(0, 1),
+    attn_mask=mask,
+    scale=replay["scale"],
 ).transpose(0, 1)
 print((output - expected).abs().max())
 ```
@@ -208,24 +237,21 @@ Its executors compute exactly what the built-in ones compute, so recipes
 without `dump` stages give the same results; with `QUANT_SUITE_TENSOR_DUMP_DIR`
 unset, nothing is written. If another package also publishes a runtime, set
 `QUANT_SUITE_RECIPE_RUNTIME=tensor_dump`. A single runtime cannot combine the
-`dump` type with another package's recipe types; `DumpRecipe`, `dump_tensor`,
-`DumpLinear` and `DumpAttention` are public so that such a runtime can be built
-by hand.
+`dump` type with another package's recipe types; `DumpRecipe`, `dump_tensor`
+and `DumpLinear` are public so that such a runtime can be built by hand.
 
 ## Run with vLLM
 
 ```bash
 QUANT_SUITE_TENSOR_DUMP_DIR=/tmp/llama31_8b_dump \
 QUANT_SUITE_TENSOR_DUMP_MAX_STEPS=4 \
-QUANT_SUITE_MHA_MICRO_BATCH_SIZE=1 \
+QUANT_SUITE_TENSOR_DUMP_ATTENTION='.*' \
 VLLM_USE_V2_MODEL_RUNNER=0 \
 vllm serve meta-llama/Llama-3.1-8B-Instruct \
   --quantization quant_suite \
   --hf-overrides '{"quantization_config_file":"experimental/tensor_dump/examples/llama_3_1_8b_instruct/dump_bf16.yaml"}' \
-  --attention-backend CUSTOM \
   --enforce-eager \
   --dtype bfloat16 \
-  --max-num-seqs 1 \
   --max-model-len 4096 \
   --max-num-batched-tokens 4096 \
   --no-enable-prefix-caching
@@ -240,30 +266,37 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
 
 - `VLLM_USE_V2_MODEL_RUNNER=0` selects vLLM's V1 model runner, whose warmup
   forwards carry no attention metadata and so are never recorded.
-- `--attention-backend CUSTOM` selects the QuantSuite attention backend,
-  the only one whose products the executor sees.
-- `--enforce-eager` runs every forward in Python; the dump raises under CUDA
-  graphs or `torch.compile`.
-- `QUANT_SUITE_MHA_MICRO_BATCH_SIZE=1` and `--max-num-seqs 1` each make every
-  attention product hold one request, which attention dumps require. Without
-  either, an attention layer with a `dump` stage fails at startup.
+- `--quantization quant_suite` with a recipe that has a `linear_recipe`
+  section starts the dump session; nothing is recorded without it.
+- `--enforce-eager` runs every forward in Python, so the attention layers'
+  forward hooks run; the dump raises under CUDA graphs or `torch.compile`.
+- `--no-enable-prefix-caching` is required while attention layers are
+  selected: rebuilding a request's keys and values needs every token's to have
+  been computed, and prefix caching skips cached prompt tokens. The dump
+  raises at startup if vLLM's config has prefix caching on.
+- The attention backend must not be `FLASHINFER`, vLLM's default on GPUs of
+  compute capability 10.x; add `--attention-backend FLASH_ATTN` there. Several
+  requests per step are recorded.
 - `--max-num-batched-tokens` at least the prompt length makes the prefill one
-  step, and `--no-enable-prefix-caching` makes it cover the whole prompt.
+  step; a smaller value splits it into chunks, which are recorded as separate
+  steps.
 - `max_tokens: 3` runs three steps (a prefill and two decodes), and
   `QUANT_SUITE_TENSOR_DUMP_MAX_STEPS=4` bounds the dump if more requests
   arrive.
 
 ## Limitations
 
-- Attention is recorded with the QuantSuite attention backend
-  (`--attention-backend CUSTOM`) only. Its attention is computed with explicit products, so it is close to, but not
-  bitwise equal to, fused attention kernels, and its cost grows with
-  `q_len * kv_len` per request.
-- MHA and GQA attention only; MLA, linear attention, sliding window and soft
-  capping are not supported.
+- Attention records describe causal MHA/GQA decoder attention, with or without
+  a sliding window and a soft cap. A selected layer that is a subclass of
+  vLLM's `Attention` (such as chunked-local or cross attention), uses ALiBi or
+  attention sinks, shares another layer's KV cache, or is not a decoder layer
+  raises `NotImplementedError` at the first forward; exclude it with
+  `QUANT_SUITE_TENSOR_DUMP_ATTENTION`. MLA layers are not `Attention` layers
+  and are never matched.
+- The bidirectional ranges of multimodal prefix-LM models are not recorded;
+  records of text-only requests replay as causal.
 - MoE expert GEMMs, `lm_head` and the embedding are not recorded.
 - Eager execution only.
-- One request per attention product.
 - Weights are recorded as registered: unquantized or fake-quantized. Natively
   quantized weights raise `NotImplementedError`.
 - Step ids agree across tensor- and pipeline-parallel ranks, not across
@@ -284,18 +317,22 @@ pytest experimental/tensor_dump/tests
 ```
 
 - `test_dump_recipe.py`: the `dump` forms, validation, round trips, the
-  example recipe, and the checks made when an executor is built.
+  example recipe, the checks made when an executor is built, and the
+  rejection of `dump` stages in attention recipes.
 - `test_options.py`: the environment variables and their errors.
 - `test_dump_linear.py`: a linear layer's files and manifest, its unchanged
   output, the step filters, dummy and nested forwards, prefill/decode labels,
   metadata without backend-specific fields, and the unsupported vLLM settings.
-- `test_dump_attention.py`: the attention files at the product level: shapes,
-  unexpanded K and V, several requests in one step, a prefill then a decode,
-  unchanged results and the single-request checks.
-- `test_dump_attention_gpu.py` (GPU and vLLM): prefill, chunked prefill,
-  decode and a two-request step through the QuantSuite attention backend, one
-  of them inside vLLM's own forward context; the output is unchanged and the
-  dumped tensors replay to the dumped output.
+- `test_dump_attention.py`: the attention hooks on a stand-in for vLLM's
+  `Attention` layer: files and replay fields (window and soft cap set and
+  unset), unchanged outputs, several requests in one step, a chunked prefill
+  then a decode holding only new rows, layer and tensor selection, dummy
+  forwards, unsupported layers, and the prefix-caching check.
+- `test_dump_attention_gpu.py` (GPU and vLLM): two requests through vLLM's
+  FlashAttention kernel over a chunked prefill and decodes, with and without a
+  sliding window, once inside vLLM's own forward context; the outputs are
+  unchanged, the dumped rows rebuild each request's keys and values, and every
+  record replays to its dumped output.
 - `test_runtime.py`: runtime resolution selects `RUNTIME` from its entry point,
   which builds the dump executors and still parses built-in presets.
 - `test_import_boundary.py`: the package imports only public QuantSuite

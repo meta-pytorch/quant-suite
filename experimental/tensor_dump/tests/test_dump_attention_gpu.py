@@ -4,8 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""``DumpAttention`` under the QuantSuite paged-attention backend: the output is
-unchanged, and the dumped Q/K/V replay to the dumped output.
+"""Attention dumps on a GPU, with vLLM's FlashAttention kernel computing the
+attention of two requests over a chunked prefill and decodes.
+
+The outputs are unchanged, the dumped new-token keys and values rebuild each
+request's history, and every record replays to its dumped output with the
+recorded scale and sliding window.
 
 Needs a GPU and vLLM; skipped without either.
 """
@@ -14,50 +18,115 @@ import contextlib
 import importlib.util
 import tempfile
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import torch
-from dump_test_utils import AttentionLayer, dump_session, load, read_manifest
-from quant_suite_recipe.definition import PipelineRecipe, QuantAttentionRecipe
-from quant_suite_recipe.runtime import QuantRecipeRuntime
-from tensor_dump.recipe import DumpRecipe
+from dump_test_utils import dump_session, FakeAttention, load, read_manifest
+from quant_suite_recipe.definition import QuantLinearRecipe
 from tensor_dump.runtime import RUNTIME
 
 _HAS_VLLM: bool = importlib.util.find_spec("vllm") is not None
-_LAYER = "model.layers.0.self_attn.attn"
+_LAYERS = ("model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn")
+_HEADS = 8
+_KV_HEADS = 2
+_HEAD_SIZE = 64
+_WINDOW = 5
+
+# Per step: (request ids, q_len of each, q_start_pos of each). Request 0's
+# prompt of 11 tokens is prefilled in two chunks.
+_SCHEDULE: list[tuple[list[int], list[int], list[int]]] = [
+    ([0, 1], [6, 4], [0, 0]),
+    ([0, 1], [5, 1], [6, 4]),
+    ([0, 1], [1, 1], [11, 5]),
+]
 
 
 @dataclass
-class _PagedMetadata:
-    slot_mapping: torch.Tensor
-    seq_lens: torch.Tensor
+class _Metadata:
     query_start_loc: torch.Tensor
-    block_table: torch.Tensor
-    decode_offset: torch.Tensor
-    num_reqs: int
-    num_actual_tokens: int
+    seq_lens: torch.Tensor
 
 
-def _replay(directory: Path, record: dict[str, Any]) -> torch.Tensor:
-    """The attention output recomputed in fp32 from the dumped Q, K and V."""
-    replay = record["replay"]
-    tensors = {
-        name: load(directory, entry).float()
-        for name, entry in record["tensors"].items()
-    }
-    group = replay["gqa_group"]
-    q = tensors["q"].transpose(0, 1)
-    k = tensors["k"].repeat_interleave(group, dim=1).transpose(0, 1)
-    v = tensors["v"].repeat_interleave(group, dim=1).transpose(0, 1)
-    causal = torch.arange(replay["q_len"])[:, None] + replay[
-        "q_start_pos"
-    ] >= torch.arange(replay["kv_len"])
-    output = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, attn_mask=causal, scale=replay["softmax_scale"]
-    )
-    return output.transpose(0, 1)
+class _FlashAttention(FakeAttention):
+    """Runs vLLM's FlashAttention kernel over each request's keys and values,
+    which the layer keeps across forwards. ``schedule`` sets the step's
+    requests before each forward."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.history: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.requests: list[int] = []
+        self.q_lens: list[int] = []
+
+    def forward(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+        q = query.view(-1, self.num_heads, self.head_size)
+        k = key.view(-1, self.num_kv_heads, self.head_size)
+        v = value.view(-1, self.num_kv_heads, self.head_size)
+        keys, values, cu_q, cu_k = [], [], [0], [0]
+        for request, q_len in zip(self.requests, self.q_lens):
+            first = cu_q[-1]
+            new_k, new_v = k[first : first + q_len], v[first : first + q_len]
+            if request in self.history:
+                old_k, old_v = self.history[request]
+                new_k, new_v = torch.cat([old_k, new_k]), torch.cat([old_v, new_v])
+            self.history[request] = (new_k, new_v)
+            keys.append(new_k)
+            values.append(new_v)
+            cu_q.append(first + q_len)
+            cu_k.append(cu_k[-1] + new_k.shape[0])
+        window = self.sliding_window
+        output = flash_attn_varlen_func(
+            q[: cu_q[-1]],
+            torch.cat(keys),
+            torch.cat(values),
+            max_seqlen_q=max(self.q_lens),
+            cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=q.device),
+            max_seqlen_k=max(b - a for a, b in zip(cu_k, cu_k[1:])),
+            cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=q.device),
+            softmax_scale=self.impl.scale,
+            causal=True,
+            window_size=[-1, -1] if window is None else [window - 1, 0],
+        )
+        return output.reshape(cu_q[-1], -1)
+
+
+class _Model(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.quantized_linear = RUNTIME.prepare_linear(QuantLinearRecipe())
+        self.layers = torch.nn.ModuleList(
+            [
+                _FlashAttention(_LAYERS[0], _HEADS, _KV_HEADS, _HEAD_SIZE),
+                _FlashAttention(
+                    _LAYERS[1],
+                    _HEADS,
+                    _KV_HEADS,
+                    _HEAD_SIZE,
+                    sliding_window=_WINDOW,
+                ),
+            ]
+        )
+
+    def layer(self, index: int) -> _FlashAttention:
+        layer = self.layers[index]
+        assert isinstance(layer, _FlashAttention)
+        return layer
+
+    def schedule(self, requests: list[int], q_lens: list[int]) -> None:
+        for index in range(len(self.layers)):
+            self.layer(index).requests = requests
+            self.layer(index).q_lens = q_lens
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> list[torch.Tensor]:
+        return [layer(q, k, v) for layer in self.layers]
 
 
 def _vllm_forward_context(
@@ -66,13 +135,38 @@ def _vllm_forward_context(
     """A vLLM forward context holding ``attn_metadata``, entered on use."""
     from vllm.forward_context import ForwardContext, override_forward_context
 
+    kwargs: dict[str, Any] = {}
+    if any(field.name == "virtual_engine" for field in fields(ForwardContext)):
+        kwargs["virtual_engine"] = 0
     context = ForwardContext(
-        no_compile_layers={},
-        attn_metadata=attn_metadata,
-        slot_mapping={},
-        virtual_engine=0,
+        no_compile_layers={}, attn_metadata=attn_metadata, slot_mapping={}, **kwargs
     )
     return override_forward_context(context)
+
+
+def _replay(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    replay: dict[str, Any],
+) -> torch.Tensor:
+    """The attention output in fp32 from Q ``[q_len, Hq, D]`` and the full keys
+    and values ``[kv_len, Hkv, D]``, using the record's fields."""
+    group = replay["num_q_heads"] // replay["num_kv_heads"]
+    positions = torch.arange(replay["q_len"])[:, None] + replay["q_start_pos"]
+    keys = torch.arange(replay["kv_len"])[None, :]
+    mask = keys <= positions
+    window = replay["sliding_window"]
+    if window is not None:
+        mask &= keys > positions - window
+    output = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(0, 1),
+        k.float().repeat_interleave(group, dim=1).transpose(0, 1),
+        v.float().repeat_interleave(group, dim=1).transpose(0, 1),
+        attn_mask=mask,
+        scale=replay["scale"],
+    )
+    return output.transpose(0, 1)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
@@ -81,169 +175,104 @@ class DumpAttentionGpuTest(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(0)
         self.device = torch.device("cuda")
-        self.num_heads = 8
-        self.num_kv_heads = 2
-        self.head_size = 64
-        self.block_size = 16
-        self.num_blocks = 32
-
-    def _randn(self, *shape: int) -> torch.Tensor:
-        return torch.randn(*shape, dtype=torch.bfloat16, device=self.device)
-
-    def _metadata(self, q_lens: list[int], q_starts: list[int]) -> _PagedMetadata:
-        seq_lens = [q_len + start for q_len, start in zip(q_lens, q_starts)]
-        max_blocks = max(-(-length // self.block_size) for length in seq_lens)
-        block_table = torch.zeros(
-            len(seq_lens), max_blocks, dtype=torch.int32, device=self.device
-        )
-        next_block = 1
-        for request, seq_len in enumerate(seq_lens):
-            count = -(-seq_len // self.block_size)
-            block_table[request, :count] = torch.arange(
-                next_block, next_block + count, dtype=torch.int32
-            )
-            next_block += count
-        starts = [0]
-        slots = []
-        for request, (q_len, q_start) in enumerate(zip(q_lens, q_starts)):
-            starts.append(starts[-1] + q_len)
-            for position in range(q_start, q_start + q_len):
-                block = int(block_table[request, position // self.block_size])
-                slots.append(block * self.block_size + position % self.block_size)
-        return _PagedMetadata(
-            slot_mapping=torch.tensor(slots, device=self.device),
-            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
-            query_start_loc=torch.tensor(starts, device=self.device),
-            block_table=block_table,
-            decode_offset=torch.tensor(q_starts, device=self.device),
-            num_reqs=len(q_lens),
-            num_actual_tokens=sum(q_lens),
-        )
-
-    def _attention(
-        self,
-        executor: torch.nn.Module,
-        q_lens: list[int],
-        q_starts: list[int],
-        inputs: tuple[torch.Tensor, ...],
-        micro_batch_size: int,
-    ) -> torch.Tensor:
-        from quant_suite_vllm.attention.backend import apply_quantized_attention
-
-        query, key, value, cached_key, cached_value = inputs
-        metadata = self._metadata(q_lens, q_starts)
-        kv_cache = torch.zeros(
-            2,
-            self.num_blocks,
-            self.block_size,
-            self.num_kv_heads,
-            self.head_size,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        for request, q_start in enumerate(q_starts):
-            for position in range(q_start):
-                block = int(metadata.block_table[request, position // self.block_size])
-                offset = position % self.block_size
-                kv_cache[0, block, offset] = cached_key[request, position]
-                kv_cache[1, block, offset] = cached_value[request, position]
-        one = torch.tensor(1.0, device=self.device)
-        return apply_quantized_attention(
-            query.clone(),
-            key.clone(),
-            value.clone(),
-            kv_cache,
-            "auto",
-            one,
-            one,
-            self.num_kv_heads,
-            self.head_size,
-            self.num_heads,
-            metadata,
-            self.head_size**-0.5,
-            executor,
-            micro_batch_size=micro_batch_size,
-        )
-
-    def _inputs(
-        self, q_lens: list[int], q_starts: list[int]
-    ) -> tuple[torch.Tensor, ...]:
-        tokens = sum(q_lens)
-        cached = max(q_starts) or 1
-        return (
-            self._randn(tokens, self.num_heads, self.head_size),
-            self._randn(tokens, self.num_kv_heads, self.head_size),
-            self._randn(tokens, self.num_kv_heads, self.head_size),
-            self._randn(len(q_lens), cached, self.num_kv_heads, self.head_size),
-            self._randn(len(q_lens), cached, self.num_kv_heads, self.head_size),
-        )
-
-    def _layer(self) -> AttentionLayer:
-        recipe = QuantAttentionRecipe(q=PipelineRecipe([DumpRecipe()]))
-        return AttentionLayer(
-            RUNTIME.prepare_attention(recipe),
-            _LAYER,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-        )
-
-    def _check_case(
-        self, q_lens: list[int], q_starts: list[int], *, real_vllm: bool = False
-    ) -> None:
-        inputs = self._inputs(q_lens, q_starts)
-        builtin = QuantRecipeRuntime().prepare_attention(QuantAttentionRecipe())
-        expected = self._attention(builtin, q_lens, q_starts, inputs, 1)
-        directory = Path(tempfile.mkdtemp())
-        attn_metadata = {_LAYER: self._metadata(q_lens, q_starts)}
-        with dump_session(directory, real_vllm=real_vllm) as forward:
-            layer = self._layer()
-            if real_vllm:
-                context = _vllm_forward_context(attn_metadata)
-            else:
-                forward.real(attn_metadata)
-                context = contextlib.nullcontext()
-            with context:
-                output = layer(
-                    lambda e: self._attention(e, q_lens, q_starts, inputs, 1)
+        self.inputs = [
+            tuple(
+                torch.randn(
+                    sum(q_lens),
+                    heads * _HEAD_SIZE,
+                    dtype=torch.bfloat16,
+                    device=self.device,
                 )
-        self.assertTrue(torch.equal(output, expected))
-        records = [r for r in read_manifest(directory) if r["record"] == "attention"]
-        self.assertEqual([r["request"] for r in records], list(range(len(q_lens))))
-        token_start = 0
-        for record, q_len in zip(records, q_lens):
-            dumped = load(directory, record["tensors"]["output"])
-            rows = output[token_start : token_start + q_len].cpu()
-            self.assertTrue(torch.equal(dumped, rows))
-            torch.testing.assert_close(
-                dumped.float(), _replay(directory, record), atol=2e-2, rtol=2e-2
+                for heads in (_HEADS, _KV_HEADS, _KV_HEADS)
             )
-            token_start += q_len
+            for _, q_lens, _ in _SCHEDULE
+        ]
 
-    def test_output_is_unchanged_and_dumps_replay(self) -> None:
-        cases = {
-            "prefill": ([7], [0]),
-            "chunked_prefill": ([5], [7]),
-            "decode": ([1], [9]),
-            "two_requests": ([3, 1], [0, 4]),
-        }
-        for name, (q_lens, q_starts) in cases.items():
-            with self.subTest(case=name):
-                self._check_case(q_lens, q_starts)
+    def _metadata(self, q_lens: list[int], q_starts: list[int]) -> _Metadata:
+        starts = [0]
+        for q_len in q_lens:
+            starts.append(starts[-1] + q_len)
+        return _Metadata(
+            query_start_loc=torch.tensor(starts, dtype=torch.int32, device=self.device),
+            seq_lens=torch.tensor(
+                [q_len + start for q_len, start in zip(q_lens, q_starts)],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
+
+    def _run(
+        self, directory: Path | None, *, real_vllm: bool
+    ) -> tuple[_Model, list[list[torch.Tensor]]]:
+        env = {} if directory is None else {"ATTENTION": ".*", "MAX_STEPS": "0"}
+        outputs = []
+        with dump_session(
+            directory,
+            real_vllm=real_vllm,
+            attention_class=_FlashAttention,
+            **env,
+        ) as forward:
+            model = _Model()
+            for (requests, q_lens, q_starts), inputs in zip(_SCHEDULE, self.inputs):
+                model.schedule(requests, q_lens)
+                metadata = {name: self._metadata(q_lens, q_starts) for name in _LAYERS}
+                if real_vllm:
+                    context = _vllm_forward_context(metadata)
+                else:
+                    forward.real(metadata)
+                    context = contextlib.nullcontext()
+                with context:
+                    outputs.append(model(*inputs))
+        return model, outputs
+
+    def _check(self, *, real_vllm: bool) -> None:
+        _, expected = self._run(None, real_vllm=False)
+        directory = Path(tempfile.mkdtemp())
+        model, outputs = self._run(directory, real_vllm=real_vllm)
+        for step_outputs, step_expected in zip(outputs, expected):
+            for output, reference in zip(step_outputs, step_expected):
+                self.assertTrue(torch.equal(output, reference))
+        records = [r for r in read_manifest(directory) if r["record"] == "attention"]
+        self.assertEqual(len(records), 2 * sum(len(s[0]) for s in _SCHEDULE))
+        for layer_index, layer in enumerate(_LAYERS):
+            history: dict[int, list[torch.Tensor]] = {}
+            for record in (r for r in records if r["layer"] == layer):
+                with self.subTest(
+                    layer=layer, step=record["step"], request=record["request"]
+                ):
+                    replay = record["replay"]
+                    self.assertEqual(
+                        replay["sliding_window"], (None, _WINDOW)[layer_index]
+                    )
+                    request = _SCHEDULE[record["step"]][0][record["request"]]
+                    tensors = {
+                        name: load(directory, entry)
+                        for name, entry in record["tensors"].items()
+                    }
+                    rows = history.setdefault(request, [])
+                    self.assertEqual(
+                        replay["kv_rows"][0], sum(t.shape[0] for t in rows[::2])
+                    )
+                    rows += [tensors["k"], tensors["v"]]
+                    k = torch.cat(rows[::2])
+                    v = torch.cat(rows[1::2])
+                    self.assertEqual(k.shape[0], replay["kv_len"])
+                    torch.testing.assert_close(
+                        tensors["output"].float(),
+                        _replay(tensors["q"], k, v, replay),
+                        atol=2e-2,
+                        rtol=2e-2,
+                    )
+            for request, rows in history.items():
+                full_k, full_v = model.layer(layer_index).history[request]
+                self.assertTrue(torch.equal(torch.cat(rows[::2]), full_k.cpu()))
+                self.assertTrue(torch.equal(torch.cat(rows[1::2]), full_v.cpu()))
+
+    def test_flash_attention_dumps_rebuild_kv_and_replay(self) -> None:
+        self._check(real_vllm=False)
 
     def test_inside_vllm_forward_context(self) -> None:
-        self._check_case([3, 1], [0, 4], real_vllm=True)
-
-    def test_two_requests_per_micro_batch_raise(self) -> None:
-        q_lens, q_starts = [3, 2], [0, 4]
-        inputs = self._inputs(q_lens, q_starts)
-        with dump_session(Path(tempfile.mkdtemp())) as forward:
-            layer = self._layer()
-            forward.real({_LAYER: self._metadata(q_lens, q_starts)})
-            with self.assertRaisesRegex(
-                RuntimeError, "QUANT_SUITE_MHA_MICRO_BATCH_SIZE"
-            ):
-                layer(lambda e: self._attention(e, q_lens, q_starts, inputs, 2))
+        self._check(real_vllm=True)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,13 @@ class OptionsTest(unittest.TestCase):
         self.assertEqual(options.max_steps, 1)
         self.assertIsNone(options.ranks)
         self.assertTrue(options.selects_rank(7))
+        self.assertIsNone(options.attention)
+        self.assertEqual(
+            options.attention_tensors, frozenset({"q", "k", "v", "output"})
+        )
+        empty = _parse(DIR="/tmp/dump", ATTENTION="")
+        assert empty is not None
+        self.assertIsNone(empty.attention)
 
     def test_grammar(self) -> None:
         options = _parse(
@@ -43,6 +50,8 @@ class OptionsTest(unittest.TestCase):
             PHASE="decode,mixed",
             MAX_STEPS="0",
             RANKS="0,3",
+            ATTENTION=r"model\.layers\.(0|7)\.",
+            ATTENTION_TENSORS="q, output",
         )
         assert options is not None
         self.assertEqual(options.steps, ((0, 1), (5, 8), (10, None)))
@@ -54,14 +63,33 @@ class OptionsTest(unittest.TestCase):
         self.assertEqual(options.max_steps, 0)
         self.assertEqual(options.ranks, frozenset({0, 3}))
         self.assertFalse(options.selects_rank(1))
+        attention = options.attention
+        assert attention is not None
+        self.assertTrue(attention.match("model.layers.7.self_attn.attn"))
+        self.assertFalse(attention.match("model.layers.1.self_attn.attn"))
+        self.assertEqual(options.attention_tensors, frozenset({"q", "output"}))
 
     def test_describe_round_trips(self) -> None:
-        options = _parse(DIR="d", STEPS="2,5:8,10:", PHASE="all", RANKS="1")
+        options = _parse(
+            DIR="d",
+            STEPS="2,5:8,10:",
+            PHASE="all",
+            RANKS="1",
+            ATTENTION="layers",
+            ATTENTION_TENSORS="v,q",
+        )
         assert options is not None
         description = options.describe()
         self.assertEqual(
             description,
-            {"steps": "2,5:8,10:", "phase": "all", "max_steps": 1, "ranks": "1"},
+            {
+                "steps": "2,5:8,10:",
+                "phase": "all",
+                "max_steps": 1,
+                "ranks": "1",
+                "attention": "layers",
+                "attention_tensors": "q,v",
+            },
         )
         self.assertEqual(
             _parse(
@@ -70,6 +98,8 @@ class OptionsTest(unittest.TestCase):
                 PHASE=str(description["phase"]),
                 MAX_STEPS=str(description["max_steps"]),
                 RANKS=str(description["ranks"]),
+                ATTENTION=str(description["attention"]),
+                ATTENTION_TENSORS=str(description["attention_tensors"]),
             ),
             options,
         )
@@ -80,6 +110,8 @@ class OptionsTest(unittest.TestCase):
             "PHASE": ["", "warmup", "prefill,"],
             "MAX_STEPS": ["", "-1", "1.5", "many"],
             "RANKS": ["", "x", "0,-1", "all,0"],
+            "ATTENTION": ["(", "layers.[0"],
+            "ATTENTION_TENSORS": ["", "p", "q,,k", "input"],
         }
         for suffix, values in cases.items():
             for value in values:

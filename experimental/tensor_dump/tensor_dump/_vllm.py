@@ -24,6 +24,13 @@ def forward_context() -> Any | None:
     return get_forward_context()
 
 
+def attention_class() -> type[Any]:
+    """vLLM's decoder attention layer class."""
+    from vllm.model_executor.layers.attention import Attention
+
+    return Attention
+
+
 def tensor_parallel() -> tuple[int, int] | None:
     """``(tp_rank, tp_size)``, or ``None`` when vLLM's groups are not set up."""
     from vllm.distributed.parallel_state import (

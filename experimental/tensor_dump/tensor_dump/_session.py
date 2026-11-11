@@ -12,8 +12,14 @@ import logging
 import os
 
 from tensor_dump import _step
+from tensor_dump._attention import _AttentionDump
 from tensor_dump._naming import _NameResolver
-from tensor_dump._options import _DIR_ENV, _DumpOptions, _options_from_environ
+from tensor_dump._options import (
+    _ATTENTION_ENV,
+    _DIR_ENV,
+    _DumpOptions,
+    _options_from_environ,
+)
 from tensor_dump._step import _StepTracker, _VllmSettings
 from tensor_dump._writer import _Writer
 
@@ -21,10 +27,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class _Session:
-    """The options, step tracker, writer and name resolver of one process.
+    """The options, step tracker, writer, name resolver and attention hooks of
+    one process.
 
     Raises:
-        RuntimeError: if vLLM's V2 model runner is enabled.
+        RuntimeError: if vLLM's V2 model runner is enabled, or attention layers
+            are selected while vLLM's prefix caching is enabled.
         NotImplementedError: if speculative decoding is configured.
     """
 
@@ -40,15 +48,30 @@ class _Session:
                 "tensor_dump does not support speculative decoding: draft-model "
                 "forwards would take step ids"
             )
+        pattern = options.attention
+        if pattern is not None and settings.prefix_caching:
+            raise RuntimeError(
+                f"{_ATTENTION_ENV} is set, and attention dumps hold the keys and "
+                "values of each step's new tokens, so every token must be "
+                "computed; vLLM's prefix caching skips cached prompt tokens. "
+                "Start vLLM with --no-enable-prefix-caching"
+            )
         self.options = options
         self.settings = settings
         self.resolver = _NameResolver()
         self.writer = _Writer(options)
         self.tracker = _StepTracker(
             options,
-            on_first_step=self.resolver.finish,
+            on_step=self.resolver.finish_from_second_step,
             on_selected_step=self.writer.begin_step,
         )
+        self.attention: _AttentionDump | None = None
+        if pattern is not None:
+            attention = _AttentionDump(
+                pattern, options.attention_tensors, self.tracker, self.writer
+            )
+            self.resolver.scan(attention.visit)
+            self.attention = attention
 
 
 _session: _Session | None = None
@@ -60,8 +83,7 @@ def _get() -> _Session | None:
     """The session, or ``None`` when dumping is disabled.
 
     The vLLM settings are read when the session is created, which is when
-    the first executor with a ``dump`` stage is built, while vLLM loads the
-    model.
+    the first linear executor is built, while vLLM loads the model.
 
     Raises:
         ValueError: on the first call, for a malformed environment variable.
@@ -92,9 +114,13 @@ def _reset() -> None:
     For tests.
     """
     global _session, _loaded, _warned_disabled
-    if _session is not None:
-        _session.resolver.finish()
-        _session.writer.close()
+    session = _session
+    if session is not None:
+        session.resolver.finish()
+        attention = session.attention
+        if attention is not None:
+            attention.remove()
+        session.writer.close()
     _session = None
     _loaded = False
     _warned_disabled = False

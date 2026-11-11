@@ -8,7 +8,7 @@
 
 import json
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +17,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
-from tensor_dump import _session, _step
+from tensor_dump import _attention, _session, _step
 from tensor_dump._step import _VllmSettings
 
 _ENV_PREFIX = "QUANT_SUITE_TENSOR_DUMP_"
@@ -88,12 +88,54 @@ class FakeForward:
         self.context = FakeForwardContext(None)
 
 
+class FakeAttention(torch.nn.Module):
+    """The attributes of vLLM's ``Attention`` layer that the dump reads.
+
+    ``forward(query, key, value)`` takes ``[tokens, heads * head_size]``
+    inputs, as vLLM's layer does, and returns ``2 * query + 1``.
+    """
+
+    def __init__(
+        self,
+        layer_name: str,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        *,
+        sliding_window: int | None = None,
+        logits_soft_cap: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.layer_name = layer_name
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.head_size_v = head_size
+        self.sliding_window = sliding_window
+        self.attn_type = "decoder"
+        self.has_sink = False
+        self.kv_sharing_target_layer_name: str | None = None
+        self.kv_cache_dtype = "auto"
+        self.impl = SimpleNamespace(
+            scale=head_size**-0.5,
+            logits_soft_cap=logits_soft_cap,
+            alibi_slopes=None,
+        )
+        self.attn_backend = SimpleNamespace(get_name=lambda: "FAKE")
+
+    def forward(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        return query * 2 + 1
+
+
 @contextmanager
 def dump_session(
     directory: Path | None,
     *,
     settings: _VllmSettings | None = None,
     real_vllm: bool = False,
+    attention_class: type[torch.nn.Module] = FakeAttention,
     **env: str,
 ) -> Iterator[FakeForward]:
     """A fresh dump session writing to ``directory``; for ``None``,
@@ -102,10 +144,14 @@ def dump_session(
     ``env`` sets the other variables by suffix, e.g. ``MAX_STEPS="2"``.
     ``settings`` stands in for the vLLM settings. With ``real_vllm``, the
     forward context, parallel state and settings come from vLLM itself.
+    ``attention_class`` stands in for vLLM's ``Attention`` class.
     """
     forward = FakeForward()
     with ExitStack() as stack:
         stack.enter_context(patch.dict(os.environ))
+        stack.enter_context(
+            patch.object(_attention, "_attention_class", return_value=attention_class)
+        )
         if not real_vllm:
             stack.enter_context(
                 patch.object(_step, "_forward_context", forward.provider)
@@ -141,33 +187,3 @@ def read_manifest(directory: Path, rank: int = 0) -> list[dict[str, Any]]:
 def load(directory: Path, entry: dict[str, Any], rank: int = 0) -> torch.Tensor:
     """The tensor a manifest ``tensors`` entry names."""
     return torch.load(directory / f"rank_{rank}" / entry["file"])
-
-
-class AttentionLayer(torch.nn.Module):
-    """The attributes of a vLLM attention layer that the dump reads.
-
-    ``forward(fn)`` returns ``fn(self.quantized_attention)``, so a test runs
-    any sequence of executor calls inside a forward of this layer.
-    """
-
-    def __init__(
-        self,
-        executor: torch.nn.Module,
-        layer_name: str,
-        num_heads: int,
-        num_kv_heads: int,
-        head_size: int,
-        micro_batch_size: int | None = None,
-    ) -> None:
-        super().__init__()
-        self.layer_name = layer_name
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_size = head_size
-        self.impl = SimpleNamespace(scale=head_size**-0.5)
-        if micro_batch_size is not None:
-            self.impl.micro_batch_size = micro_batch_size
-        self.quantized_attention = executor
-
-    def forward(self, fn: Callable[[torch.nn.Module], torch.Tensor]) -> torch.Tensor:
-        return fn(self.quantized_attention)

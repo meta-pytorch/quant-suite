@@ -18,8 +18,9 @@ from quant_suite_recipe.definition import (
     QuantAttentionRecipe,
     QuantLinearRecipe,
 )
+from quant_suite_recipe.implementation.attention import QuantizedAttention
 from quant_suite_recipe.runtime import QuantRecipeRuntime
-from tensor_dump.executors import DumpAttention, DumpLinear
+from tensor_dump.executors import DumpLinear
 from tensor_dump.runtime import RUNTIME
 
 _ENTRY_POINT = metadata.EntryPoint(
@@ -49,8 +50,9 @@ class RuntimeTest(unittest.TestCase):
             self.assertIsInstance(
                 RUNTIME.prepare_linear(QuantLinearRecipe()), DumpLinear
             )
-            self.assertIsInstance(
-                RUNTIME.prepare_attention(QuantAttentionRecipe()), DumpAttention
+            self.assertIs(
+                type(RUNTIME.prepare_attention(QuantAttentionRecipe())),
+                QuantizedAttention,
             )
 
     def test_builtin_preset_still_parses(self) -> None:
