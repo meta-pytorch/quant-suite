@@ -7,6 +7,7 @@
 """Attention dumps from forward hooks on a stand-in for vLLM's ``Attention``
 layer. CPU only."""
 
+import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,7 @@ from dump_test_utils import (
     dump_session,
     fake_metadata,
     FakeAttention,
+    flashinfer_metadata,
     generic_metadata,
     load,
     read_manifest,
@@ -228,6 +230,35 @@ class DumpAttentionTest(unittest.TestCase):
             [[0, 2], [3, 4]],
         )
 
+    def test_flashinfer_metadata_maps_requests_to_rows(self) -> None:
+        # Decodes first, then a chunk of a prefill and a whole prompt.
+        q_lens, q_starts = [1, 2, 3], [4, 3, 0]
+        with dump_session(self.directory, ATTENTION=_LAYERS[0]) as forward:
+            model = _Model()
+            forward.real(
+                {name: flashinfer_metadata(q_lens, q_starts) for name in _LAYERS}
+            )
+            q, k, v = _inputs(sum(q_lens))
+            model(q, k, v)
+        records = _records(self.directory)
+        self.assertEqual(
+            [(r["request"], r["phase"]) for r in records],
+            [(0, "decode"), (1, "prefill"), (2, "prefill")],
+        )
+        for record, rows, kv_rows in zip(
+            records,
+            (slice(0, 1), slice(1, 3), slice(3, 6)),
+            ([4, 5], [3, 5], [0, 3]),
+        ):
+            with self.subTest(request=record["request"]):
+                self.assertEqual(record["replay"]["kv_rows"], kv_rows)
+                self.assertTrue(
+                    torch.equal(
+                        load(self.directory, record["tensors"]["v"]),
+                        _heads(v[rows], _KV_HEADS),
+                    )
+                )
+
     def test_selection_by_pattern_and_tensors(self) -> None:
         with dump_session(
             self.directory,
@@ -253,6 +284,21 @@ class DumpAttentionTest(unittest.TestCase):
         with dump_session(self.directory, ATTENTION=".*") as forward:
             model = _Model()
             forward.dummy()
+            model(*_inputs(3))
+            self.assertEqual(list(self.directory.iterdir()), [])
+            _run(forward, model, [3], [0])
+        self.assertEqual(
+            sorted({r["step"] for r in _records(self.directory)}),
+            [0],
+        )
+
+    def test_forward_without_kv_slots_writes_nothing(self) -> None:
+        metadata = dataclasses.replace(
+            generic_metadata([3], [0]), slot_mapping=torch.full((3,), -1)
+        )
+        with dump_session(self.directory, ATTENTION=".*") as forward:
+            model = _Model()
+            forward.real({name: metadata for name in _LAYERS})
             model(*_inputs(3))
             self.assertEqual(list(self.directory.iterdir()), [])
             _run(forward, model, [3], [0])

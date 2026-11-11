@@ -8,6 +8,7 @@
 built-in executor computes. CPU only."""
 
 import contextlib
+import dataclasses
 import tempfile
 import unittest
 import weakref
@@ -18,8 +19,11 @@ import torch
 from dump_test_utils import (
     dump_session,
     fake_metadata,
+    FakeFlashInferMetadata,
     FakeForward,
     FakeForwardContext,
+    FakeWrapperMetadata,
+    flashinfer_metadata,
     generic_metadata,
     load,
     read_manifest,
@@ -167,6 +171,61 @@ class DumpLinearTest(unittest.TestCase):
         (step,) = _records(self.directory, "step")
         self.assertEqual(step["step"], 0)
 
+    def test_forward_without_kv_slots_writes_nothing_and_takes_no_step(self) -> None:
+        # The mixed batch of vLLM's FlashInfer warmup: 8 decodes, one prefill.
+        warmup = dataclasses.replace(
+            flashinfer_metadata([1] * 8 + [8], [0] * 8 + [1]),
+            slot_mapping=torch.full((16,), -1),
+        )
+        with dump_session(self.directory) as forward:
+            model = _model()
+            forward.real({_ATTN: warmup})
+            model(torch.randn(16, 4))
+            self.assertEqual(list(self.directory.iterdir()), [])
+            # Padding after the request's tokens has no slot either.
+            forward.real(
+                {
+                    _ATTN: dataclasses.replace(
+                        fake_metadata([3], [0]),
+                        slot_mapping=torch.tensor([0, 1, 2, -1]),
+                    )
+                }
+            )
+            model(torch.randn(3, 4))
+        (step,) = _records(self.directory, "step")
+        self.assertEqual(step["step"], 0)
+        self.assertEqual(
+            [(r["q_len"], r["q_start_pos"]) for r in step["requests"]], [(3, 0)]
+        )
+        self.assertEqual(len(_records(self.directory, "linear")), 1)
+
+    def test_forward_without_kv_slots_takes_a_step_under_context_parallelism(
+        self,
+    ) -> None:
+        # A rank may hold the KV-cache slots of none of a step's tokens.
+        settings = _VllmSettings(context_parallel=True)
+        metadata = dataclasses.replace(
+            fake_metadata([1], [4]), slot_mapping=torch.tensor([-1])
+        )
+        with dump_session(self.directory, settings=settings) as forward:
+            model = _model()
+            forward.real({_ATTN: metadata})
+            model(torch.randn(1, 4))
+        (step,) = _records(self.directory, "step")
+        self.assertEqual(step["step"], 0)
+
+    def test_context_parallel_is_read_from_the_config(self) -> None:
+        config = _vllm_config(use_v2_model_runner=False)
+        self.assertFalse(_settings_from(config, None).context_parallel)
+        for name in ("decode_context_parallel_size", "prefill_context_parallel_size"):
+            config.parallel_config = SimpleNamespace(**{name: 2})
+            self.assertTrue(_settings_from(config, None).context_parallel)
+        config.parallel_config = SimpleNamespace(
+            decode_context_parallel_size=None, prefill_context_parallel_size=None
+        )
+        self.assertFalse(_settings_from(config, None).context_parallel)
+        self.assertIsNone(_settings_from(None, None).context_parallel)
+
     def test_disabled_writes_nothing(self) -> None:
         # Every other variable is set and the working directory is the would-be
         # output root, so a write anywhere relative to it would show up.
@@ -259,6 +318,147 @@ class DumpLinearTest(unittest.TestCase):
             forward.real({_ATTN: SimpleNamespace(slot_mapping=None)})
             with self.assertRaisesRegex(RuntimeError, "SimpleNamespace"):
                 model(torch.randn(3, 4))
+
+    def test_flashinfer_metadata_requests(self) -> None:
+        # (q_len, kv_len, q_start_pos, token_start, phase) per request.
+        cases = {
+            "decode_only": (
+                flashinfer_metadata([1, 1], [4, 7]),
+                "decode",
+                [(1, 5, 4, 0, "decode"), (1, 8, 7, 1, "decode")],
+            ),
+            "ragged_decode": (
+                flashinfer_metadata([1, 1], [4, 7], ragged_decode=True),
+                "decode",
+                [(1, 5, 4, 0, "decode"), (1, 8, 7, 1, "decode")],
+            ),
+            "prefill_only": (
+                flashinfer_metadata([3, 2], [0, 0]),
+                "prefill",
+                [(3, 3, 0, 0, "prefill"), (2, 2, 0, 3, "prefill")],
+            ),
+            "mixed_decodes_first": (
+                flashinfer_metadata([1, 1, 3], [4, 7, 0]),
+                "mixed",
+                [
+                    (1, 5, 4, 0, "decode"),
+                    (1, 8, 7, 1, "decode"),
+                    (3, 3, 0, 2, "prefill"),
+                ],
+            ),
+            "chunked_prefill": (
+                flashinfer_metadata([1, 4, 2], [9, 6, 0]),
+                "mixed",
+                [
+                    (1, 10, 9, 0, "decode"),
+                    (4, 10, 6, 1, "prefill"),
+                    (2, 2, 0, 5, "prefill"),
+                ],
+            ),
+        }
+        for name, (metadata, phase, expected) in cases.items():
+            with self.subTest(case=name):
+                directory = Path(tempfile.mkdtemp())
+                with dump_session(directory) as forward:
+                    model = _model()
+                    forward.real({_ATTN: metadata})
+                    model(torch.randn(metadata.num_actual_tokens, 4))
+                (step,) = _records(directory, "step")
+                self.assertEqual(step["phase"], phase)
+                self.assertEqual(step["num_actual_tokens"], metadata.num_actual_tokens)
+                self.assertEqual(
+                    [r["request"] for r in step["requests"]],
+                    list(range(len(expected))),
+                )
+                self.assertEqual(
+                    [
+                        (
+                            r["q_len"],
+                            r["kv_len"],
+                            r["q_start_pos"],
+                            r["token_start"],
+                            r["phase"],
+                        )
+                        for r in step["requests"]
+                    ],
+                    expected,
+                )
+
+    def test_flashinfer_paths_without_lengths_raise(self) -> None:
+        def native_prefill() -> FakeFlashInferMetadata:
+            metadata = flashinfer_metadata([1, 3], [4, 0])
+            metadata.prefill = FakeWrapperMetadata()
+            return metadata
+
+        def native_decode() -> FakeFlashInferMetadata:
+            metadata = flashinfer_metadata([1, 3], [4, 0])
+            metadata.decode = FakeWrapperMetadata()
+            return metadata
+
+        def context_parallel_decode() -> FakeFlashInferMetadata:
+            metadata = flashinfer_metadata([1], [4])
+            metadata.decode.dcp_query_start_loc = torch.tensor([0, 1])
+            return metadata
+
+        def multi_token_decode() -> FakeFlashInferMetadata:
+            # Two decodes of two query tokens each, without query offsets.
+            metadata = flashinfer_metadata([1, 1], [4, 7])
+            metadata.decode.q_len_per_req = 2
+            metadata.num_decode_tokens = 4
+            metadata.num_actual_tokens = 4
+            return metadata
+
+        def cascade() -> FakeFlashInferMetadata:
+            metadata = flashinfer_metadata([3], [0])
+            metadata.use_cascade = True
+            return metadata
+
+        def counts_disagree() -> FakeFlashInferMetadata:
+            metadata = flashinfer_metadata([1, 1], [4, 7])
+            metadata.num_decode_tokens = 3
+            return metadata
+
+        cases = {
+            "native_prefill": (
+                native_prefill,
+                "FakeWrapperMetadata.*use_trtllm_attention=1",
+            ),
+            "native_decode": (
+                native_decode,
+                "FakeWrapperMetadata.*--attention-backend FLASH_ATTN",
+            ),
+            "context_parallel": (
+                context_parallel_decode,
+                "--decode-context-parallel-size 1",
+            ),
+            "multi_token_decode": (
+                multi_token_decode,
+                "q_cu_seq_lens is None and its q_len_per_req is 2",
+            ),
+            "cascade": (cascade, "--disable-cascade-attn"),
+            "counts_disagree": (counts_disagree, "not over its 3 tokens"),
+        }
+        for name, (make, message) in cases.items():
+            with self.subTest(case=name):
+                metadata = make()
+                with dump_session(Path(tempfile.mkdtemp())) as forward:
+                    model = _model()
+                    forward.real({_ATTN: metadata})
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        model(torch.randn(metadata.num_actual_tokens, 4))
+
+    def test_query_start_loc_metadata_is_preferred_to_flashinfer(self) -> None:
+        with dump_session(self.directory) as forward:
+            model = _model()
+            forward.real(
+                {
+                    "flashinfer": flashinfer_metadata([3], [0]),
+                    _ATTN: generic_metadata([3], [4]),
+                }
+            )
+            model(torch.randn(3, 4))
+        (step,) = _records(self.directory, "step")
+        self.assertEqual(step["requests"][0]["q_start_pos"], 4)
 
     def test_v2_model_runner_raises_at_startup(self) -> None:
         settings = _VllmSettings(v2_model_runner=True)

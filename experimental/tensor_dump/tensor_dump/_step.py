@@ -7,11 +7,12 @@
 """Step ids from vLLM's forward context, and prefill/decode classification.
 
 vLLM creates one forward context object per model forward. A forward whose
-context has no attention metadata is a dummy forward (profiling, warmup): it
-gets no step id and writes nothing. Every other forward gets the next step id,
-counted per process, so all ranks that run the same forwards agree on it. A
-forward keeps its step id for as long as its context object lives, even when
-another context is entered and left inside it.
+context has no attention metadata, or whose attention metadata assigns no token
+a KV-cache slot, is a dummy forward (profiling, warmup): it gets no step id and
+writes nothing. Every other forward gets the next step id, counted per process,
+so all ranks that run the same forwards agree on it. A forward keeps its step
+id for as long as its context object lives, even when another context is
+entered and left inside it.
 """
 
 from __future__ import annotations
@@ -76,11 +77,14 @@ class _VllmSettings:
             no vLLM config is current.
         prefix_caching: Whether vLLM's prefix caching is enabled; ``None`` when
             no vLLM config is current.
+        context_parallel: Whether decode or prefill context parallelism is
+            configured; ``None`` when no vLLM config is current.
     """
 
     v2_model_runner: bool = False
     speculative: bool | None = None
     prefix_caching: bool | None = None
+    context_parallel: bool | None = None
 
 
 def _forward_context() -> Any | None:
@@ -107,10 +111,18 @@ def _settings_from(config: Any | None, v2_env: bool | None) -> _VllmSettings:
     """
     if config is None:
         return _VllmSettings(v2_model_runner=v2_env is True)
+    parallel = getattr(config, "parallel_config", None)
     return _VllmSettings(
         v2_model_runner=bool(getattr(config, "use_v2_model_runner", v2_env is True)),
         speculative=config.speculative_config is not None,
         prefix_caching=bool(config.cache_config.enable_prefix_caching),
+        context_parallel=any(
+            int(getattr(parallel, name, None) or 1) > 1
+            for name in (
+                "decode_context_parallel_size",
+                "prefill_context_parallel_size",
+            )
+        ),
     )
 
 
@@ -138,19 +150,234 @@ def _has_request_fields(metadata: Any) -> bool:
     )
 
 
+_FLASHINFER_COUNTS = (
+    "num_decodes",
+    "num_decode_tokens",
+    "num_prefills",
+    "num_prefill_tokens",
+)
+
+
+def _is_flashinfer(metadata: Any) -> bool:
+    """Whether ``metadata`` has the fields of vLLM's FlashInfer metadata."""
+    return (
+        all(getattr(metadata, name, None) is not None for name in _FLASHINFER_COUNTS)
+        and hasattr(metadata, "prefill")
+        and hasattr(metadata, "decode")
+    )
+
+
+def _describes_requests(metadata: Any) -> bool:
+    return _has_request_fields(metadata) or _is_flashinfer(metadata)
+
+
+def _flashinfer_error(metadata: Any, part: str, reason: str) -> RuntimeError:
+    return RuntimeError(
+        f"tensor_dump cannot read the {part} requests of "
+        f"{type(metadata).__name__}: {reason}"
+    )
+
+
+def _flashinfer_decode(metadata: Any) -> Any:
+    """The decode part of FlashInfer metadata, if it holds per-request lengths.
+
+    Raises:
+        RuntimeError: for FlashInfer's native decode wrapper, or decode
+            context parallelism, whose ``seq_lens`` are local to the rank.
+    """
+    decode = getattr(metadata, "decode", None)
+    if decode is None:
+        raise _flashinfer_error(metadata, "decode", "it has no decode metadata")
+    if (
+        getattr(decode, "seq_lens", None) is None
+        or getattr(decode, "q_len_per_req", None) is None
+    ):
+        raise _flashinfer_error(
+            metadata,
+            "decode",
+            f"FlashInfer runs them through {type(decode).__name__}, which keeps "
+            "their lengths inside a FlashInfer wrapper. FlashInfer uses its "
+            "TRTLLM or XQA decode kernels instead on GPUs of compute capability "
+            "9.0, 10.x and 12.x, unless --attention-config.use_trtllm_attention=0 "
+            "is set or the layer's head counts or head size rule them out; "
+            "otherwise start vLLM with --attention-backend FLASH_ATTN",
+        )
+    if getattr(decode, "dcp_query_start_loc", None) is not None:
+        raise _flashinfer_error(
+            metadata,
+            "decode",
+            "under decode context parallelism its seq_lens hold each rank's "
+            "share of the keys and values; start vLLM with "
+            "--decode-context-parallel-size 1",
+        )
+    return decode
+
+
+def _flashinfer_prefill(metadata: Any) -> Any:
+    """The prefill part of FlashInfer metadata, if it holds per-request lengths.
+
+    Raises:
+        RuntimeError: for FlashInfer's native prefill wrapper.
+    """
+    prefill = getattr(metadata, "prefill", None)
+    if prefill is None:
+        raise _flashinfer_error(metadata, "prefill", "it has no prefill metadata")
+    if (
+        getattr(prefill, "seq_lens", None) is None
+        or getattr(prefill, "cum_seq_lens_q", None) is None
+    ):
+        raise _flashinfer_error(
+            metadata,
+            "prefill",
+            f"FlashInfer runs them through {type(prefill).__name__}, which keeps "
+            "their lengths inside a FlashInfer wrapper. FlashInfer uses its "
+            "TRTLLM prefill kernel instead only on GPUs of compute capability "
+            "10.x without decode context parallelism, where "
+            "--attention-config.use_trtllm_attention=1 selects it; otherwise "
+            "start vLLM with --attention-backend FLASH_ATTN",
+        )
+    return prefill
+
+
+def _flashinfer_lengths(
+    metadata: Any, part: str, name: str, tensor: torch.Tensor, count: int
+) -> torch.Tensor:
+    """The first ``count`` entries of ``tensor``.
+
+    Raises:
+        RuntimeError: if it has fewer.
+    """
+    lengths = tensor[:count]
+    if lengths.numel() != count:
+        raise _flashinfer_error(
+            metadata, part, f"its {name} has {lengths.numel()} entries, not {count}"
+        )
+    return lengths
+
+
+def _parse_flashinfer_requests(metadata: Any) -> tuple[_RequestInfo, ...]:
+    """The requests of vLLM's FlashInfer metadata.
+
+    FlashInfer orders the batch decodes first. Decode lengths come from its
+    TRTLLM/XQA decode metadata (``seq_lens``, and ``q_cu_seq_lens``, or one
+    query token per request when it is ``None``), prefill lengths from its
+    TRTLLM prefill metadata (``seq_lens``, and ``cum_seq_lens_q`` counted from
+    the first prefill token).
+
+    Raises:
+        RuntimeError: for a FlashInfer path whose metadata does not hold
+            per-request lengths, decodes of several query tokens without
+            ``q_cu_seq_lens``, or counts that disagree with the lengths.
+    """
+    if getattr(metadata, "use_cascade", False):
+        raise _flashinfer_error(
+            metadata,
+            "batch",
+            "FlashInfer cascade attention keeps them inside a FlashInfer "
+            "wrapper; start vLLM with --disable-cascade-attn",
+        )
+    num_decodes = int(metadata.num_decodes)
+    num_decode_tokens = int(metadata.num_decode_tokens)
+    num_prefills = int(metadata.num_prefills)
+    # (part, requests, tokens, first token row, uniform q_len or None)
+    parts: list[tuple[str, int, int, int, int | None]] = []
+    pieces: list[torch.Tensor] = []
+    if num_decodes:
+        decode = _flashinfer_decode(metadata)
+        q_cu_seq_lens = getattr(decode, "q_cu_seq_lens", None)
+        pieces.append(
+            _flashinfer_lengths(
+                metadata, "decode", "seq_lens", decode.seq_lens, num_decodes
+            )
+        )
+        uniform = None
+        if q_cu_seq_lens is not None:
+            pieces.append(
+                _flashinfer_lengths(
+                    metadata, "decode", "q_cu_seq_lens", q_cu_seq_lens, num_decodes + 1
+                )
+            )
+        else:
+            uniform = int(decode.q_len_per_req)
+            if uniform != 1:
+                raise _flashinfer_error(
+                    metadata,
+                    "decode",
+                    f"its q_cu_seq_lens is None and its q_len_per_req is "
+                    f"{uniform}, not 1; without speculative decoding every "
+                    f"decode request has one query token",
+                )
+        parts.append(("decode", num_decodes, num_decode_tokens, 0, uniform))
+    if num_prefills:
+        prefill = _flashinfer_prefill(metadata)
+        pieces.append(
+            _flashinfer_lengths(
+                metadata, "prefill", "seq_lens", prefill.seq_lens, num_prefills
+            )
+        )
+        pieces.append(
+            _flashinfer_lengths(
+                metadata,
+                "prefill",
+                "cum_seq_lens_q",
+                prefill.cum_seq_lens_q,
+                num_prefills + 1,
+            )
+        )
+        tokens = int(metadata.num_prefill_tokens)
+        parts.append(("prefill", num_prefills, tokens, num_decode_tokens, None))
+    # One host transfer for every length of the step.
+    values = [int(value) for value in torch.cat(pieces).tolist()] if pieces else []
+    requests: list[_RequestInfo] = []
+    taken = 0
+    for part, count, tokens, first_token, uniform in parts:
+        kv_lens = values[taken : taken + count]
+        taken += count
+        if uniform is None:
+            offsets = values[taken : taken + count + 1]
+            taken += count + 1
+        else:
+            offsets = [index * uniform for index in range(count + 1)]
+        if offsets[0] != 0 or offsets[-1] != tokens:
+            raise _flashinfer_error(
+                metadata,
+                part,
+                f"its query offsets run from {offsets[0]} to {offsets[-1]}, "
+                f"not over its {tokens} tokens",
+            )
+        for kv_len, start, end in zip(kv_lens, offsets, offsets[1:]):
+            q_start_pos = kv_len - (end - start)
+            requests.append(
+                _RequestInfo(
+                    request=len(requests),
+                    q_len=end - start,
+                    kv_len=kv_len,
+                    q_start_pos=q_start_pos,
+                    token_start=first_token + start,
+                    phase=_request_phase(end - start, q_start_pos),
+                )
+            )
+    return tuple(requests)
+
+
 def _parse_requests(metadata: Any) -> tuple[_RequestInfo, ...]:
     """The requests of one attention-metadata object.
 
     Reads ``query_start_loc`` and ``seq_lens``; ``num_reqs`` and
-    ``decode_offset`` are used when present, and derived otherwise.
+    ``decode_offset`` are used when present, and derived otherwise. Metadata
+    without these fields is read as vLLM's FlashInfer metadata when it has
+    FlashInfer's fields; see ``_parse_flashinfer_requests``.
 
     Raises:
-        RuntimeError: if the metadata lacks ``query_start_loc`` or ``seq_lens``.
+        RuntimeError: if the metadata describes no requests this way.
     """
     if not _has_request_fields(metadata):
+        if _is_flashinfer(metadata):
+            return _parse_flashinfer_requests(metadata)
         raise RuntimeError(
-            f"tensor_dump needs query_start_loc and seq_lens in the attention "
-            f"metadata, which {type(metadata).__name__} does not provide"
+            f"tensor_dump needs query_start_loc and seq_lens, or FlashInfer's "
+            f"decode and prefill fields, in the attention metadata, which "
+            f"{type(metadata).__name__} does not provide"
         )
     num_reqs = getattr(metadata, "num_reqs", None)
     if num_reqs is None:
@@ -178,15 +405,38 @@ def _parse_requests(metadata: Any) -> tuple[_RequestInfo, ...]:
 
 
 def _step_metadata(attn_metadata: dict[str, Any]) -> Any:
-    """The first metadata entry that describes the step's requests."""
-    for metadata in attn_metadata.values():
-        if _has_request_fields(metadata):
-            return metadata
+    """The first metadata entry that describes the step's requests, preferring
+    one with ``query_start_loc`` and ``seq_lens``."""
+    for describes in (_has_request_fields, _describes_requests):
+        for metadata in attn_metadata.values():
+            if describes(metadata):
+                return metadata
     types = sorted({type(metadata).__name__ for metadata in attn_metadata.values()})
     raise RuntimeError(
-        f"tensor_dump needs query_start_loc and seq_lens in the attention "
-        f"metadata, which none of {types} provides"
+        f"tensor_dump needs query_start_loc and seq_lens, or FlashInfer's decode "
+        f"and prefill fields, in the attention metadata, which none of {types} "
+        f"provides"
     )
+
+
+def _assigns_no_kv_slot(attn_metadata: dict[str, Any]) -> bool:
+    """Whether every ``slot_mapping`` entry of the attention metadata is
+    negative, so no token of the forward has a KV-cache slot.
+
+    vLLM marks a token without a slot with ``-1``. A request forward gives each
+    of its tokens a slot and marks only padding; a dummy forward marks every
+    token. ``False`` when no entry has a non-empty ``slot_mapping``.
+    """
+    mappings: dict[int, torch.Tensor] = {}
+    for metadata in attn_metadata.values():
+        slot_mapping = getattr(metadata, "slot_mapping", None)
+        if isinstance(slot_mapping, torch.Tensor) and slot_mapping.numel():
+            mappings[id(slot_mapping)] = slot_mapping
+    if not mappings:
+        return False
+    # One host transfer for every slot mapping of the forward.
+    largest = torch.stack([mapping.max().long() for mapping in mappings.values()])
+    return int(largest.max()) < 0
 
 
 @dataclass
@@ -207,6 +457,9 @@ class _StepTracker:
         on_selected_step: Called at the start of every step that is written.
         total_bytes: The bytes the rank's dump directory holds, checked
             against the byte budget before a step is written.
+        context_parallel: Whether vLLM runs with context parallelism, under
+            which a rank may hold no KV-cache slot for any token of a request
+            forward; forwards are then not checked for KV-cache slots.
     """
 
     def __init__(
@@ -215,8 +468,11 @@ class _StepTracker:
         on_step: Callable[[int], None],
         on_selected_step: Callable[[_StepInfo], None],
         total_bytes: Callable[[], int],
+        *,
+        context_parallel: bool = False,
     ) -> None:
         self._options = options
+        self._context_parallel = context_parallel
         self._on_step = on_step
         self._on_selected_step = on_selected_step
         self._total_bytes = total_bytes
@@ -287,20 +543,33 @@ class _StepTracker:
             forward.requests[id(metadata)] = requests
         return requests
 
-    def _start_step(self, context: Any, forward: _Forward) -> _StepInfo | None:
+    def _is_dummy(self, context: Any) -> bool:
+        """Whether the forward has no attention metadata, or assigns no token a
+        KV-cache slot.
+
+        Raises:
+            NotImplementedError: for dual-batch-overlap micro-batches.
+            RuntimeError: when the forward runs with CUDA graphs.
+        """
         attn_metadata = context.attn_metadata
         if isinstance(attn_metadata, list):
             raise NotImplementedError(
                 "tensor_dump does not support dual-batch-overlap micro-batches"
             )
         if not attn_metadata:
-            return None
+            return True
         mode = getattr(context, "cudagraph_runtime_mode", None)
         if mode is not None and mode.name != "NONE":
             raise RuntimeError(
                 f"tensor_dump requires eager execution, but the forward runs with "
                 f"CUDA graph mode {mode.name}; start vLLM with --enforce-eager"
             )
+        return not self._context_parallel and _assigns_no_kv_slot(attn_metadata)
+
+    def _start_step(self, context: Any, forward: _Forward) -> _StepInfo | None:
+        if self._is_dummy(context):
+            return None
+        attn_metadata = context.attn_metadata
         step = self._next_step
         self._next_step += 1
         if self._rank is None:

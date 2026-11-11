@@ -101,24 +101,45 @@ only.
 A step is one model forward. `QUANT_SUITE_TENSOR_DUMP_STEPS` and
 `QUANT_SUITE_TENSOR_DUMP_MAX_STEPS` count the forwards of the current process
 from 0; the step ids written to the manifest continue after those of earlier
-runs in the same directory (see [Appending runs](#appending-runs)). Forwards
-without attention metadata, such as the profiling and warmup runs of
-vLLM's V1 model runner, get no step id and are never written. The V2 model
-runner warms up with real forwards that carry attention metadata and cannot be
-told apart from requests, so the dump refuses to start under it: launch vLLM
-with `VLLM_USE_V2_MODEL_RUNNER=0`, which selects the V1 runner. All ranks of a
+runs in the same directory (see [Appending runs](#appending-runs)). The
+profiling and warmup runs of vLLM's V1 model runner get no step id and are
+never written: they carry no attention metadata, or, like the FlashInfer
+attention warmup that vLLM runs when every attention layer uses `FLASHINFER`,
+attention metadata whose `slot_mapping` gives no token a KV-cache slot (every
+entry `-1`). Under decode or prefill context parallelism a rank may hold the
+slots of none of a request step's tokens, so there only forwards without
+attention metadata are skipped. The V2 model runner warms up with real forwards
+that carry attention metadata and cannot be told apart from requests, so the
+dump refuses to start under it: launch vLLM with `VLLM_USE_V2_MODEL_RUNNER=0`,
+which selects the V1 runner. All ranks of a
 tensor- or pipeline-parallel group run the same forwards, so their step ids
 agree; ranks that do not write still count steps.
 
-The requests of a step come from the attention metadata's `query_start_loc`
-and `seq_lens`, so recording either kind of layer needs an attention backend
-whose metadata has both: vLLM's `FLASH_ATTN`, `TRITON_ATTN`, `FLEX_ATTENTION`,
-`ROCM_ATTN` and `CPU_ATTN`. `FLASHINFER` is not supported: the dump raises at
-the first step under it. vLLM selects `FLASHINFER` by default on GPUs of
-compute capability 10.x; choose another backend with
-`--attention-backend FLASH_ATTN`. An attention layer reads its own metadata
-entry; `q_start_pos` is `kv_len - q_len`. Linear and attention records share
-the step ids, and attention can be recorded without any linear `dump` stage.
+The requests of a step come from the attention metadata, so recording either
+kind of layer needs an attention backend whose metadata describes them:
+
+- `FLASH_ATTN`, `TRITON_ATTN`, `FLEX_ATTENTION`, `ROCM_ATTN` and `CPU_ATTN`
+  provide `query_start_loc` and `seq_lens`.
+- `FLASHINFER`, vLLM's default on GPUs of compute capability 10.x, puts a
+  step's decodes before its prefills and runs each group either on a TRTLLM
+  or XQA kernel, whose metadata holds the requests' lengths, or on a native
+  FlashInfer wrapper, which keeps them to itself. The dump reads the first
+  and raises `RuntimeError` naming the second:
+
+  | requests | read on | raise on |
+  | --- | --- | --- |
+  | prefills | the TRTLLM prefill: compute capability 10.x, chosen by default for an unquantized KV cache or a quantized query, and by `--attention-config.use_trtllm_attention=1` | the native wrapper: other GPUs, decode context parallelism, `--attention-config.use_trtllm_attention=0` |
+  | decodes | the TRTLLM or XQA decode: compute capability 9.0, 10.x and 12.x | the native wrapper: `--attention-config.use_trtllm_attention=0`, head counts or sizes those kernels do not support; and decode context parallelism, whose `seq_lens` are local to the rank |
+
+  With vLLM's defaults on compute capability 10.x every step is read. On
+  other GPUs only steps without prefills are, so use
+  `--attention-backend FLASH_ATTN` there.
+- `TRITON_FLASHINFER` gives each step either `TRITON_ATTN`'s or
+  `FLASHINFER`'s metadata, read as above.
+
+An attention layer reads its own metadata entry; `q_start_pos` is
+`kv_len - q_len`. Linear and attention records share the step ids, and
+attention can be recorded without any linear `dump` stage.
 
 A request is `decode` when it has one query token after position 0, and
 `prefill` otherwise, including chunked-prefill chunks. A step is `prefill` or
@@ -431,7 +452,8 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
 ```
 
 - `VLLM_USE_V2_MODEL_RUNNER=0` selects vLLM's V1 model runner, whose warmup
-  forwards carry no attention metadata and so are never recorded.
+  forwards carry no attention metadata or no KV-cache slots and so are never
+  recorded.
 - `--quantization quant_suite` with a recipe that has a `linear_recipe`
   section starts the dump session; nothing is recorded without it.
 - `--enforce-eager` runs every forward in Python, so the attention layers'
@@ -440,9 +462,11 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
   selected: rebuilding a request's keys and values needs every token's to have
   been computed, and prefix caching skips cached prompt tokens. The dump
   raises at startup if vLLM's config has prefix caching on.
-- The attention backend must not be `FLASHINFER`, vLLM's default on GPUs of
-  compute capability 10.x; add `--attention-backend FLASH_ATTN` there. Several
-  requests per step are recorded.
+- The default attention backend works: `FLASH_ATTN`, or `FLASHINFER` on GPUs
+  of compute capability 10.x. On other GPUs, `FLASHINFER` runs prefills on a
+  path the dump cannot read (see
+  [Environment variables](#environment-variables)). Several requests per step
+  are recorded.
 - `--max-num-batched-tokens` at least the prompt length makes the prefill one
   step; a smaller value splits it into chunks, which are recorded as separate
   steps.
@@ -463,6 +487,9 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
   records of text-only requests replay as causal.
 - MoE expert GEMMs, `lm_head` and the embedding are not recorded.
 - Eager execution only.
+- Under `FLASHINFER`, a step whose prefills or decodes run on FlashInfer's
+  native wrappers raises `RuntimeError` (see
+  [Environment variables](#environment-variables)).
 - Weights are recorded as registered: unquantized or fake-quantized. Natively
   quantized weights raise `NotImplementedError`.
 - Step ids agree across tensor- and pipeline-parallel ranks, not across
@@ -499,13 +526,17 @@ pytest experimental/tensor_dump/tests
   weight, an unlisted weight file, another format and a truncated manifest),
   and the byte budget, earlier runs included.
 - `test_dump_linear.py`: a linear layer's files and manifest, its unchanged
-  output, the step filters, dummy and nested forwards, prefill/decode labels,
-  metadata without backend-specific fields, and the unsupported vLLM settings.
+  output, the step filters, dummy forwards (without attention metadata or
+  without KV-cache slots) and nested forwards, prefill/decode labels,
+  metadata without backend-specific fields, FlashInfer metadata (decodes,
+  prefills, a mixed batch, a chunked prefill, and the paths it cannot read),
+  and the unsupported vLLM settings.
 - `test_dump_attention.py`: the attention hooks on a stand-in for vLLM's
   `Attention` layer: files and replay fields (window and soft cap set and
   unset), unchanged outputs, several requests in one step, a chunked prefill
-  then a decode holding only new rows, layer and tensor selection, dummy
-  forwards, unsupported layers, and the prefix-caching check.
+  then a decode holding only new rows, FlashInfer metadata mapped to rows,
+  layer and tensor selection, dummy forwards (without attention metadata or
+  without KV-cache slots), unsupported layers, and the prefix-caching check.
 - `test_dump_attention_gpu.py` (GPU and vLLM): two requests through vLLM's
   FlashAttention kernel over a chunked prefill and decodes, with and without a
   sliding window, once inside vLLM's own forward context; the outputs are

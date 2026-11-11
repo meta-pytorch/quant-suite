@@ -173,14 +173,20 @@ Recommended:
 
 The attention hooks capture the same tensors under every attention backend,
 and the record's `backend` field says which one ran. The dump reads each
-step's requests from the attention metadata's `query_start_loc` and
-`seq_lens`, which vLLM's FLASH_ATTN, TRITON_ATTN, FLEX_ATTENTION, ROCM_ATTN
-and CPU_ATTN backends provide and FLASHINFER does not. FLASHINFER is vLLM's
-default on GPUs of compute capability 10.x, so on those GPUs add
-`--attention-backend FLASH_ATTN` to the launch command. Elsewhere the default
-is FLASH_ATTN and no flag is needed. vLLM's profiling and warmup forwards
-carry no attention metadata, so they are never written. Nothing exists under
-the dump directory until the first real step.
+step's requests from the attention metadata: `query_start_loc` and
+`seq_lens` under vLLM's FLASH_ATTN, TRITON_ATTN, FLEX_ATTENTION, ROCM_ATTN
+and CPU_ATTN backends, and the TRTLLM prefill and TRTLLM or XQA decode
+metadata under FLASHINFER. vLLM's default backend works without a flag:
+FLASHINFER on GPUs of compute capability 10.x, which runs prefills and
+decodes on those kernels there, and FLASH_ATTN elsewhere. On other GPUs
+FLASHINFER runs prefills through its native wrapper, which the dump cannot
+read, so do not select it there. The
+[README](README.md#environment-variables) lists the FLASHINFER settings
+that raise. vLLM's profiling and warmup forwards are never written: they
+carry no attention metadata, or attention metadata that gives no token a
+KV-cache slot, as the FlashInfer attention warmup does (the server log shows
+`Warming up FlashInfer attention.`). Nothing exists under the dump directory
+until the first real step.
 
 ## 6. Control the volume
 
@@ -421,7 +427,9 @@ print((out - a.output.float()).abs().max())
 | `tensor_dump does not support vLLM's V2 model runner ...` at model load | vLLM 0.30 uses the V2 runner by default | Set `VLLM_USE_V2_MODEL_RUNNER=0`. |
 | `QUANT_SUITE_TENSOR_DUMP_ATTENTION is set ... Start vLLM with --no-enable-prefix-caching` | Prefix caching is on while attention layers are selected | Add `--no-enable-prefix-caching`. |
 | `tensor_dump requires eager execution ...` at the first request | CUDA graphs or `torch.compile` are on | Add `--enforce-eager`. |
-| `tensor_dump needs query_start_loc and seq_lens in the attention metadata ...` at the first request | The attention backend is FLASHINFER (vLLM's default on compute capability 10.x), whose metadata lacks these fields | Add `--attention-backend FLASH_ATTN`. |
+| `tensor_dump needs query_start_loc and seq_lens, or FlashInfer's decode and prefill fields, ...` at the first request | The attention backend's metadata describes no requests in a form the dump reads | Add `--attention-backend FLASH_ATTN`. |
+| `tensor_dump cannot read the prefill requests of FlashInferMetadata: FlashInfer runs them through FIPrefill ...` | FLASHINFER runs prefills through its native wrapper: on a GPU below compute capability 10.0, with decode context parallelism, or with `--attention-config.use_trtllm_attention=0` | On compute capability 10.x, add `--attention-config.use_trtllm_attention=1`; elsewhere add `--attention-backend FLASH_ATTN`. |
+| `tensor_dump cannot read the decode requests of FlashInferMetadata: ...` | FLASHINFER runs decodes through its native wrapper, or under decode context parallelism | Follow the message: drop `--attention-config.use_trtllm_attention=0`, run with `--decode-context-parallel-size 1`, or add `--attention-backend FLASH_ATTN`. |
 | The server dies during warmup while JIT-compiling a sampling kernel (a missing CUDA header or build tool) | The system CUDA toolkit does not match the one PyTorch was built with | Set `VLLM_USE_FLASHINFER_SAMPLER=0` to use the PyTorch sampler, or install a matching toolkit. Greedy decoding picks the same tokens either way. |
 | `Invalid config type: 'dump'` | The server's environment does not resolve to `tensor_dump`'s runtime: the package is missing there, or another runtime was selected | Install `tensor_dump` in the server's environment, run the check in step 2, and set `QUANT_SUITE_RECIPE_RUNTIME=tensor_dump` if several runtimes are installed. |
 | `Several QuantSuite recipe runtimes are installed ...` | Another package also publishes a runtime | Set `QUANT_SUITE_RECIPE_RUNTIME=tensor_dump`. |

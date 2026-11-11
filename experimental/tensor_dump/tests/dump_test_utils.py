@@ -25,13 +25,15 @@ _ENV_PREFIX = "QUANT_SUITE_TENSOR_DUMP_"
 
 @dataclass
 class FakeAttentionMetadata:
-    """The attention-metadata fields the dump reads."""
+    """The attention-metadata fields the dump reads. ``slot_mapping`` is the
+    token's KV-cache slot, ``-1`` for none; ``None`` leaves it out."""
 
     query_start_loc: torch.Tensor
     seq_lens: torch.Tensor
     decode_offset: torch.Tensor
     num_reqs: int
     num_actual_tokens: int
+    slot_mapping: torch.Tensor | None = None
 
 
 def fake_metadata(
@@ -58,6 +60,7 @@ class GenericAttentionMetadata:
 
     query_start_loc: torch.Tensor
     seq_lens: torch.Tensor
+    slot_mapping: torch.Tensor | None = None
 
 
 def generic_metadata(
@@ -65,6 +68,89 @@ def generic_metadata(
 ) -> GenericAttentionMetadata:
     full = fake_metadata(q_lens, q_start_positions)
     return GenericAttentionMetadata(full.query_start_loc, full.seq_lens)
+
+
+@dataclass
+class FakeTrtllmPrefill:
+    """The fields of vLLM's FlashInfer TRTLLM prefill metadata the dump reads."""
+
+    seq_lens: torch.Tensor
+    cum_seq_lens_q: torch.Tensor
+
+
+@dataclass
+class FakeTrtllmDecode:
+    """The fields of vLLM's FlashInfer TRTLLM/XQA decode metadata the dump
+    reads."""
+
+    seq_lens: torch.Tensor
+    q_len_per_req: int = 1
+    q_cu_seq_lens: torch.Tensor | None = None
+    dcp_query_start_loc: torch.Tensor | None = None
+
+
+@dataclass
+class FakeWrapperMetadata:
+    """FlashInfer's native prefill or decode metadata, which holds only a
+    wrapper."""
+
+    wrapper: object = None
+
+
+@dataclass
+class FakeFlashInferMetadata:
+    """The fields of vLLM's FlashInfer metadata the dump reads."""
+
+    num_actual_tokens: int
+    num_decodes: int
+    num_decode_tokens: int
+    num_prefills: int
+    num_prefill_tokens: int
+    prefill: Any
+    decode: Any
+    use_cascade: bool = False
+    slot_mapping: torch.Tensor | None = None
+
+
+def flashinfer_metadata(
+    q_lens: list[int], q_start_positions: list[int], *, ragged_decode: bool = False
+) -> FakeFlashInferMetadata:
+    """FlashInfer metadata for requests in batch order, decodes first: the
+    leading requests with one query token are decodes, as FlashInfer splits
+    them. With ``ragged_decode``, the decodes carry ``q_cu_seq_lens``."""
+    num_decodes = 0
+    while num_decodes < len(q_lens) and q_lens[num_decodes] == 1:
+        num_decodes += 1
+    kv_lens = [q_len + start for q_len, start in zip(q_lens, q_start_positions)]
+    prefill_lens = q_lens[num_decodes:]
+    decode = None
+    if num_decodes:
+        decode = FakeTrtllmDecode(
+            seq_lens=torch.tensor(kv_lens[:num_decodes], dtype=torch.int32),
+            q_cu_seq_lens=(
+                torch.arange(num_decodes + 1, dtype=torch.int32)
+                if ragged_decode
+                else None
+            ),
+        )
+    prefill = None
+    if prefill_lens:
+        offsets = [0]
+        for q_len in prefill_lens:
+            offsets.append(offsets[-1] + q_len)
+        prefill = FakeTrtllmPrefill(
+            seq_lens=torch.tensor(kv_lens[num_decodes:], dtype=torch.int32),
+            cum_seq_lens_q=torch.tensor(offsets, dtype=torch.int32),
+        )
+    return FakeFlashInferMetadata(
+        num_actual_tokens=sum(q_lens),
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decodes,
+        num_prefills=len(prefill_lens),
+        num_prefill_tokens=sum(prefill_lens),
+        prefill=prefill,
+        decode=decode,
+    )
 
 
 @dataclass(eq=False)
