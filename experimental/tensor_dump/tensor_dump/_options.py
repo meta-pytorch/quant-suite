@@ -18,6 +18,7 @@ _STEPS_ENV = "QUANT_SUITE_TENSOR_DUMP_STEPS"
 _PHASE_ENV = "QUANT_SUITE_TENSOR_DUMP_PHASE"
 _MAX_STEPS_ENV = "QUANT_SUITE_TENSOR_DUMP_MAX_STEPS"
 _RANKS_ENV = "QUANT_SUITE_TENSOR_DUMP_RANKS"
+_MAX_BYTES_ENV = "QUANT_SUITE_TENSOR_DUMP_MAX_BYTES"
 _ATTENTION_ENV = "QUANT_SUITE_TENSOR_DUMP_ATTENTION"
 _ATTENTION_TENSORS_ENV = "QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS"
 
@@ -25,6 +26,14 @@ _PHASES: frozenset[str] = frozenset({"prefill", "decode", "mixed"})
 _ATTENTION_TENSORS: frozenset[str] = frozenset({"q", "k", "v", "output"})
 _INT_RE: re.Pattern[str] = re.compile(r"[0-9]+")
 _RANGE_RE: re.Pattern[str] = re.compile(r"([0-9]+):([0-9]*)")
+_BYTES_RE: re.Pattern[str] = re.compile(r"([0-9]+)([KMGT]?)", re.IGNORECASE)
+_BYTE_UNITS: dict[str, int] = {
+    "": 1,
+    "K": 10**3,
+    "M": 10**6,
+    "G": 10**9,
+    "T": 10**12,
+}
 
 
 @dataclass(frozen=True)
@@ -38,6 +47,8 @@ class _DumpOptions:
         phases: Step phases that are written.
         max_steps: Cap on the number of steps written; 0 means no cap.
         ranks: Global ranks that write; ``None`` means every rank.
+        max_bytes: Budget on the bytes of a rank's dump directory, earlier runs
+            included; no step starts once it is reached. 0 means no budget.
         attention: Attention layers that write, matched against vLLM's layer
             name with ``re.match``; ``None`` means no attention layer.
         attention_tensors: Tensors each selected attention layer writes.
@@ -48,6 +59,7 @@ class _DumpOptions:
     phases: frozenset[str]
     max_steps: int
     ranks: frozenset[int] | None
+    max_bytes: int
     attention: re.Pattern[str] | None
     attention_tensors: frozenset[str]
 
@@ -78,6 +90,7 @@ class _DumpOptions:
             "phase": phase,
             "max_steps": self.max_steps,
             "ranks": ranks,
+            "max_bytes": self.max_bytes,
             "attention": attention,
             "attention_tensors": ",".join(sorted(self.attention_tensors)),
         }
@@ -144,6 +157,16 @@ def _parse_ranks(value: str) -> frozenset[int] | None:
     return frozenset(ranks)
 
 
+def _parse_max_bytes(value: str) -> int:
+    match = _BYTES_RE.fullmatch(value.strip())
+    if match is None:
+        raise ValueError(
+            f"{_MAX_BYTES_ENV}={value!r} is not a non-negative integer with an "
+            "optional K, M, G or T suffix"
+        )
+    return int(match.group(1)) * _BYTE_UNITS[match.group(2).upper()]
+
+
 def _parse_attention(value: str) -> re.Pattern[str] | None:
     if not value:
         return None
@@ -182,6 +205,7 @@ def _options_from_environ(environ: Mapping[str, str]) -> _DumpOptions | None:
         phases=_parse_phases(environ.get(_PHASE_ENV, "all")),
         max_steps=_parse_max_steps(environ.get(_MAX_STEPS_ENV, "1")),
         ranks=_parse_ranks(environ.get(_RANKS_ENV, "all")),
+        max_bytes=_parse_max_bytes(environ.get(_MAX_BYTES_ENV, "0")),
         attention=_parse_attention(environ.get(_ATTENTION_ENV, "")),
         attention_tensors=_parse_attention_tensors(
             environ.get(_ATTENTION_TENSORS_ENV, "q,k,v,output")

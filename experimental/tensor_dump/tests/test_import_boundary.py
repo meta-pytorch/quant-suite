@@ -54,6 +54,7 @@ _OTHER_ALLOWED_ROOTS: frozenset[str] = frozenset(
         "__future__",
         "collections",
         "dataclasses",
+        "hashlib",
         "importlib",
         "json",
         "logging",

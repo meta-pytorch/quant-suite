@@ -205,6 +205,8 @@ class _StepTracker:
         options: The dump options.
         on_step: Called with the step id at the start of every real forward.
         on_selected_step: Called at the start of every step that is written.
+        total_bytes: The bytes the rank's dump directory holds, checked
+            against the byte budget before a step is written.
     """
 
     def __init__(
@@ -212,10 +214,12 @@ class _StepTracker:
         options: _DumpOptions,
         on_step: Callable[[int], None],
         on_selected_step: Callable[[_StepInfo], None],
+        total_bytes: Callable[[], int],
     ) -> None:
         self._options = options
         self._on_step = on_step
         self._on_selected_step = on_selected_step
+        self._total_bytes = total_bytes
         # Keyed by id() and checked against a weak reference, since vLLM's
         # forward contexts are not hashable.
         self._forwards: dict[int, _Forward] = {}
@@ -223,6 +227,7 @@ class _StepTracker:
         self._rank: int | None = None
         self._steps_written = 0
         self._cap_logged = False
+        self._budget_logged = False
 
     def current(self) -> _StepInfo | None:
         """The step of the running forward; ``None`` for a dummy forward or
@@ -266,8 +271,11 @@ class _StepTracker:
         return forward
 
     def _forget(self, key: int) -> Callable[[weakref.ref[Any]], None]:
-        def forget(_: weakref.ref[Any]) -> None:
-            self._forwards.pop(key, None)
+        def forget(ref: weakref.ref[Any]) -> None:
+            # Another context may hold the id by now; drop only this entry.
+            forward = self._forwards.get(key)
+            if forward is not None and forward.context is ref:
+                del self._forwards[key]
 
         return forget
 
@@ -317,6 +325,20 @@ class _StepTracker:
         phase = _classify(requests)
         if phase not in self._options.phases:
             return unselected
+        max_bytes = self._options.max_bytes
+        if max_bytes:
+            total = self._total_bytes()
+            if total >= max_bytes:
+                if not self._budget_logged:
+                    self._budget_logged = True
+                    logger.info(
+                        "tensor_dump holds %d bytes, at least the "
+                        "QUANT_SUITE_TENSOR_DUMP_MAX_BYTES budget of %d; nothing "
+                        "more is written",
+                        total,
+                        max_bytes,
+                    )
+                return unselected
         self._steps_written += 1
         num_actual_tokens = getattr(metadata, "num_actual_tokens", None)
         info = _StepInfo(

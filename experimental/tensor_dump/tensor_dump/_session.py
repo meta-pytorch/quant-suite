@@ -64,6 +64,7 @@ class _Session:
             options,
             on_step=self.resolver.finish_from_second_step,
             on_selected_step=self.writer.begin_step,
+            total_bytes=self.writer.total_bytes,
         )
         self.attention: _AttentionDump | None = None
         if pattern is not None:

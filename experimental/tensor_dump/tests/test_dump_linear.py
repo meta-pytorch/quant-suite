@@ -10,6 +10,7 @@ built-in executor computes. CPU only."""
 import contextlib
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,13 +59,29 @@ class _Model(torch.nn.Module):
         return self.layer(x)
 
 
+class _TwoLayers(torch.nn.Module):
+    """Two linear layers that write their input; ``second`` picks the one a
+    forward runs."""
+
+    def __init__(self, second_name: str) -> None:
+        super().__init__()
+        self.first = _model(tensors=("input",)).layer
+        self.second = _model(tensors=("input",)).layer
+        self.second.prefix = second_name
+
+    def forward(self, x: torch.Tensor, second: bool = False) -> torch.Tensor:
+        return self.second(x) if second else self.first(x)
+
+
 def _model(tensors: tuple[str, ...] | None = ("input", "weight", "output")) -> _Model:
     stages = [] if tensors is None else [DumpRecipe(tensors=tensors)]
     recipe = QuantLinearRecipe(activation=PipelineRecipe(stages))
     return _Model(RUNTIME.prepare_linear(recipe))
 
 
-def _prefill(forward: FakeForward, model: _Model, tokens: int = 3) -> torch.Tensor:
+def _prefill(
+    forward: FakeForward, model: torch.nn.Module, tokens: int = 3
+) -> torch.Tensor:
     forward.real({_ATTN: fake_metadata([tokens], [0])})
     return model(torch.randn(tokens, 4))
 
@@ -281,16 +298,41 @@ class DumpLinearTest(unittest.TestCase):
                 _model()
 
     def test_nested_context_keeps_the_outer_step(self) -> None:
+        other = "model.layers.1.mlp.down_proj"
         with dump_session(self.directory, MAX_STEPS="0") as forward:
-            model = _model(tensors=("input",))
+            model = _TwoLayers(other)
             _prefill(forward, model)
             outer = forward.context
             _prefill(forward, model)
             forward.context = outer
-            model(torch.randn(3, 4))
-        steps = [record["step"] for record in _records(self.directory, "linear")]
-        self.assertEqual(steps, [0, 1, 0])
+            model(torch.randn(3, 4), second=True)
+        self.assertEqual(
+            [(r["step"], r["layer"]) for r in _records(self.directory, "linear")],
+            [(0, _NAME), (1, _NAME), (0, other)],
+        )
         self.assertEqual(len(_records(self.directory, "step")), 2)
+
+    def test_layer_recorded_twice_in_a_step_raises(self) -> None:
+        with dump_session(self.directory) as forward:
+            model = _model(tensors=("input",))
+            _prefill(forward, model)
+            with self.assertRaisesRegex(RuntimeError, "ran twice in one step"):
+                model(torch.randn(3, 4))
+
+    def test_stale_context_callback_keeps_the_live_entry(self) -> None:
+        # A callback of a dead context whose id the live context now holds.
+        with dump_session(self.directory, MAX_STEPS="0") as forward:
+            model = _model(tensors=("input",))
+            _prefill(forward, model)
+            session = _session._get()
+            assert session is not None
+            tracker = session.tracker
+            stale = weakref.ref(FakeForwardContext(None))
+            tracker._forget(id(forward.context))(stale)
+            step = tracker.current()
+            assert step is not None
+            self.assertEqual(step.step, 0)
+        self.assertEqual(len(_records(self.directory, "step")), 1)
 
     def test_cuda_graph_forward_raises(self) -> None:
         with dump_session(self.directory) as forward:
@@ -310,14 +352,6 @@ class DumpLinearTest(unittest.TestCase):
             )
             with self.assertRaises(NotImplementedError):
                 model(torch.randn(3, 4))
-
-    def test_existing_manifest_raises(self) -> None:
-        (self.directory / "rank_0").mkdir()
-        (self.directory / "rank_0" / "manifest.jsonl").write_text("")
-        with dump_session(self.directory) as forward:
-            model = _model()
-            with self.assertRaises(FileExistsError):
-                _prefill(forward, model)
 
 
 if __name__ == "__main__":

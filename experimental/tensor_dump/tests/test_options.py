@@ -35,6 +35,7 @@ class OptionsTest(unittest.TestCase):
         self.assertEqual(options.max_steps, 1)
         self.assertIsNone(options.ranks)
         self.assertTrue(options.selects_rank(7))
+        self.assertEqual(options.max_bytes, 0)
         self.assertIsNone(options.attention)
         self.assertEqual(
             options.attention_tensors, frozenset({"q", "k", "v", "output"})
@@ -75,6 +76,7 @@ class OptionsTest(unittest.TestCase):
             STEPS="2,5:8,10:",
             PHASE="all",
             RANKS="1",
+            MAX_BYTES="20M",
             ATTENTION="layers",
             ATTENTION_TENSORS="v,q",
         )
@@ -87,6 +89,7 @@ class OptionsTest(unittest.TestCase):
                 "phase": "all",
                 "max_steps": 1,
                 "ranks": "1",
+                "max_bytes": 20_000_000,
                 "attention": "layers",
                 "attention_tensors": "q,v",
             },
@@ -98,11 +101,27 @@ class OptionsTest(unittest.TestCase):
                 PHASE=str(description["phase"]),
                 MAX_STEPS=str(description["max_steps"]),
                 RANKS=str(description["ranks"]),
+                MAX_BYTES=str(description["max_bytes"]),
                 ATTENTION=str(description["attention"]),
                 ATTENTION_TENSORS=str(description["attention_tensors"]),
             ),
             options,
         )
+
+    def test_max_bytes_suffixes_are_powers_of_1000(self) -> None:
+        cases = {
+            "17": 17,
+            "2K": 2_000,
+            "3m": 3_000_000,
+            "1G": 10**9,
+            "5t": 5 * 10**12,
+            "0": 0,
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                options = _parse(DIR="d", MAX_BYTES=value)
+                assert options is not None
+                self.assertEqual(options.max_bytes, expected)
 
     def test_malformed_values_name_the_variable(self) -> None:
         cases = {
@@ -110,6 +129,7 @@ class OptionsTest(unittest.TestCase):
             "PHASE": ["", "warmup", "prefill,"],
             "MAX_STEPS": ["", "-1", "1.5", "many"],
             "RANKS": ["", "x", "0,-1", "all,0"],
+            "MAX_BYTES": ["", "-1", "1.5G", "1KB", "G", "1 G"],
             "ATTENTION": ["(", "layers.[0"],
             "ATTENTION_TENSORS": ["", "p", "q,,k", "input"],
         }

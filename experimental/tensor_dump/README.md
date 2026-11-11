@@ -76,9 +76,11 @@ to the linear layers, and building the first linear executor is what starts
 the dump session, attention hooks included. `attention_recipe` is not needed.
 `lm_head` and the embedding are not QuantSuite layers and are never recorded.
 
-The weight of a layer is written once, at the first step the layer writes.
-Writing every weight of a model is as large as its checkpoint, so the example
-selects the weights of one decoder layer only.
+The weight of a layer is written once per dump directory, at the first step
+the layer writes; later runs appended to the directory check it instead (see
+[Appending runs](#appending-runs)). Writing every weight of a model is as large
+as its checkpoint, so the example selects the weights of one decoder layer
+only.
 
 ## Environment variables
 
@@ -89,12 +91,16 @@ selects the weights of one decoder layer only.
 | `QUANT_SUITE_TENSOR_DUMP_PHASE` | `all` | Step phases that may be written: a comma list of `prefill`, `decode`, `mixed`, or `all`. |
 | `QUANT_SUITE_TENSOR_DUMP_MAX_STEPS` | `1` | At most this many steps are written, counting steps that pass the other filters; `0` means no cap. |
 | `QUANT_SUITE_TENSOR_DUMP_RANKS` | `all` | Comma list of the global ranks that write. |
+| `QUANT_SUITE_TENSOR_DUMP_MAX_BYTES` | unset | Byte budget of each rank's directory: an integer with an optional suffix `K`, `M`, `G` or `T` (case-insensitive, powers of 1000, so `500G` is 500 * 10^9 bytes). Unset or `0` means no budget. See [Byte budget](#byte-budget). |
 | `QUANT_SUITE_TENSOR_DUMP_ATTENTION` | unset | Regular expression over vLLM's attention layer names (`Attention.layer_name`, e.g. `model.layers.0.self_attn.attn`), matched with `re.match` like recipe patterns. Unset or empty records no attention layer. |
 | `QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS` | `q,k,v,output` | Comma list of the tensors each selected attention layer writes. |
 | `VLLM_USE_V2_MODEL_RUNNER` | set by vLLM | Must be `0` while dumping: the V2 model runner's warmup forwards cannot be told apart from requests, so the dump refuses to start under it. |
 
-A step is one model forward. Step ids count the forwards of a process from 0;
-forwards without attention metadata, such as the profiling and warmup runs of
+A step is one model forward. `QUANT_SUITE_TENSOR_DUMP_STEPS` and
+`QUANT_SUITE_TENSOR_DUMP_MAX_STEPS` count the forwards of the current process
+from 0; the step ids written to the manifest continue after those of earlier
+runs in the same directory (see [Appending runs](#appending-runs)). Forwards
+without attention metadata, such as the profiling and warmup runs of
 vLLM's V1 model runner, get no step id and are never written. The V2 model
 runner warms up with real forwards that carry attention metadata and cannot be
 told apart from requests, so the dump refuses to start under it: launch vLLM
@@ -135,21 +141,23 @@ $QUANT_SUITE_TENSOR_DUMP_DIR/
 
 Each `.pt` file holds one tensor, saved with `torch.save`. Layer directories
 use the layer name verbatim: the linear layer's prefix, and vLLM's
-`layer_name` for attention. A manifest that already exists is an error, so
-two runs never mix: use a new directory for each run.
+`layer_name` for attention. No file is ever overwritten.
 
 `manifest.jsonl` indexes the files, one JSON object per line; read it rather
 than parsing paths. Every path is relative to `rank_<R>/`.
 
-- `run`: written first. `format_version` (2), `rank`, `world_size`,
-  `tp_rank`, `tp_size`, `options` and `torch_version`.
+- `run`: written at the first written step of each run. `format_version`
+  (2), `run` (0 for the first run in the directory, then 1, 2, ...),
+  `first_step` (the manifest step id of the run's process step 0), `rank`,
+  `world_size`, `tp_rank`, `tp_size`, `options` and `torch_version`.
 - `step`: one per written step. `step`, `phase`, `num_actual_tokens`, and
   `requests`, each with `request` (its index in the step's batch), `q_len`,
   `kv_len`, `q_start_pos`, `token_start` (its first row in the linear tensors)
   and `phase`.
 - `linear`: `step`, `layer` and `tensors`, which maps each written tensor to
-  its `file`, `shape` and `dtype`.
-- `weight`: as `linear`, for the weight and bias; `step` is the step it was
+  its `file`, `shape`, `dtype` and `bytes` (the file size).
+- `weight`: as `linear`, for the weight and bias, whose entries also hold
+  `sha256`, the SHA-256 of the tensor's bytes; `step` is the step it was
   written at.
 - `attention`: `step`, `layer`, `request`, `phase`, `tensors`, and `replay`:
 
@@ -170,6 +178,59 @@ than parsing paths. Every path is relative to `rank_<R>/`.
 | `backend` | vLLM's name for the attention backend that computed the output, e.g. `FLASH_ATTN` |
 
 `tensors` lists only the tensors that were written.
+
+### Appending runs
+
+A run whose rank directory already holds a `manifest.jsonl` appends to it:
+
+- it writes a new `run` record, and numbers its steps from `first_step`, one
+  after the largest step id recorded so far, so step ids are unique across
+  runs and no step directory is reused;
+- a weight that an earlier run recorded is not written again. At the layer's
+  first written step, its current weight and bias are compared with the
+  record by shape, dtype and SHA-256; a difference means a different model or
+  recipe and raises `RuntimeError`. A weight file that no record lists also
+  raises;
+- a manifest in another format, or with a line an interrupted run left
+  incomplete, raises `RuntimeError`.
+
+Only one process may write a rank directory at a time.
+
+Checksums cost host time: each checked weight is copied to the host and hashed
+with SHA-256 on one CPU core, so the check adds time proportional to the
+selected weight bytes (roughly a second per GB). A first run hashes the host
+copy it saves; a later run hashes each weight it checks and writes nothing. The
+cost falls on the first written step of every run.
+
+### Request boundaries
+
+Requests carry no ids. A reader segments them with the per-request fields of
+the `step` records (and `replay` of the `attention` records), in step-id order:
+
+- `q_start_pos == 0` marks a request's first step;
+- its next step, if written, has `q_start_pos` equal to this step's `kv_len`.
+
+Runs do not break this: step ids keep increasing across them, and every
+request of a run starts in that run. With one request per step (for example
+one client request at a time), consecutive steps chain into requests by these
+two rules. With several requests per step, `request` is only an index within
+the step's batch and vLLM may reorder the batch between steps, so requests
+cannot be followed across steps; requests that start at `q_start_pos == 0` in
+a step can still be told apart within it. The rules need every token to be
+computed: with prefix caching on (allowed when no attention layer is
+selected), a request's first step can have `q_start_pos > 0`. Steps left out
+by the step filters or the byte budget break the chains they fall in.
+
+### Byte budget
+
+With `QUANT_SUITE_TENSOR_DUMP_MAX_BYTES` set, each rank counts the bytes its
+directory holds: the manifest and every file it lists, earlier runs included
+(from the manifest's `bytes`, read once when the rank first needs it). The
+count is checked when a step that would be written starts: once it has
+reached the budget, no further step is written, and one INFO message says so.
+A step that starts below the budget is written whole, so the directory can
+end up over the budget by up to one step; a long prefill step of a large
+model can be tens of GB. Ranks count only their own directory.
 
 ### Replaying an attention record
 
@@ -308,6 +369,11 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
   step.
 - Every written tensor is copied to the host and saved synchronously, so
   written steps are slow.
+- One process per rank directory: concurrent runs into the same directory
+  are not supported.
+- A layer is recorded once per step: a module that runs twice in one forward,
+  such as a shared layer, raises `RuntimeError` at its second call in a
+  written step.
 
 ## Tests
 
@@ -320,6 +386,10 @@ pytest experimental/tensor_dump/tests
   example recipe, the checks made when an executor is built, and the
   rejection of `dump` stages in attention recipes.
 - `test_options.py`: the environment variables and their errors.
+- `test_dump_append.py`: runs appended to one directory (step ids, unchanged
+  files, weights checked instead of rewritten, and the errors for a different
+  weight, an unlisted weight file, another format and a truncated manifest),
+  and the byte budget, earlier runs included.
 - `test_dump_linear.py`: a linear layer's files and manifest, its unchanged
   output, the step filters, dummy and nested forwards, prefill/decode labels,
   metadata without backend-specific fields, and the unsupported vLLM settings.
