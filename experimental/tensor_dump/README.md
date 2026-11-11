@@ -232,10 +232,78 @@ A step that starts below the budget is written whole, so the directory can
 end up over the budget by up to one step; a long prefill step of a large
 model can be tens of GB. Ranks count only their own directory.
 
+### Merging a dump
+
+A dump holds one file per tensor, layer and step. `tensor_dump.merge`
+rewrites it as one file per request, phase and layer:
+
+```bash
+python -m tensor_dump.merge /tmp/llama31_8b_dump /tmp/llama31_8b_merged [--delete-source] [--threads N]
+```
+
+or `tensor_dump.merge.merge(src, dst, delete_source=False)`. Merge is
+I/O-bound; the command line caps torch's intra-op threads to avoid
+oversubscription, at the smaller of 4 and the CPU count unless `--threads`
+sets it. `merge()` called from Python leaves the caller's thread setting
+alone. For each rank:
+
+```
+<dst>/rank_<R>/
+  manifest.json
+  weights/<layer>.pt                 # {"weight": W, "bias": b}
+  req_<NNNN>/prefill/<layer>.pt      # linear: {"input", "output"}
+  req_<NNNN>/decode/<layer>.pt       # attention: {"q", "k", "v", "output"}
+```
+
+- `<NNNN>` is the request's `id` (see [Reading a dump](#reading-a-dump)).
+  A request's rows of a step go to the phase it has in that step, so the
+  requests of a `mixed` step are split between `prefill` and `decode`.
+- Each tensor stacks the request's rows of the phase along dim 0 in step
+  order, which is position order: every prefill chunk, then one row per
+  decode step. Linear `input` is `[T, in]` and `output` `[T, out]`;
+  attention `q` and `output` are `[T, num_q_heads, head_size]`, `k` and `v`
+  `[T, num_kv_heads, head_size]`. Dtypes are kept.
+- `k` and `v` hold each step's new rows, so for a request whose prefill rows
+  come before its decode rows, the full keys of decode row `i` are
+  `cat([prefill["k"], decode["k"][: i + 1]])`.
+- `manifest.json` keeps everything the per-step manifest held: the `run`
+  and `step` records; per weight, its file, shapes, dtypes and SHA-256; per
+  request and phase, the `segments` that map its rows to steps (`row_start`,
+  `q_len`, `step`, `run`, `request`, `token_start`, `q_start_pos`,
+  `kv_len`; row `row_start + j` is at position `q_start_pos + j`), each
+  layer's file, shapes and dtypes, and each attention layer's `replay`
+  fields other than the positions the segments give. Fields that change
+  between steps are stored per row range (`replay_ranges`) instead.
+- Per request it also records `prompt_len`, `generated_len`,
+  `starts_at_zero` (its first step is in the dump), `may_continue` (its run
+  did not write the next step, and a step filter, `MAX_STEPS` or the byte
+  budget would have left that step out) and `complete` (the first and not
+  the second). Incomplete requests are merged like the others.
+- Each merged file is read back and compared bit for bit with the tensors it
+  was made from before the manifest lists it; a difference raises
+  `RuntimeError`.
+- With `--delete-source`, the dump's files are deleted once everything made
+  from them is verified: a step directory once every request with rows in
+  it is, a weight once its merged copy is, and each rank's `manifest.jsonl`
+  last. Files no manifest lists are never deleted.
+- Only bytes verified against the merged copy are ever deleted. When
+  `--delete-source` resumes a merge, the merged files of requests and weights
+  an earlier run wrote are read again and compared bit for bit with the
+  dump's files still there before any of those is deleted; a difference
+  raises `RuntimeError` and deletes nothing of that request or weight.
+- A merge that stops part way resumes when run again with the same
+  arguments: requests and weights the destination manifest lists are checked
+  against the dump and skipped. A run appended to the dump after a merge
+  adds its requests on the next merge. Memory holds about one request's
+  tensors of one layer at a time.
+
 ### Reading a dump
 
 `tensor_dump.reader.TensorDump` reads a dump directory, all runs and ranks
-included. It follows requests across steps by the rules of
+included, as written or merged: a directory with any
+`rank_<R>/manifest.jsonl` is read as written, otherwise its
+`rank_<R>/manifest.json` as merged, and both give the same steps, requests
+and tensors. It follows requests across steps by the rules of
 [Request boundaries](#request-boundaries), pairs each linear layer's
 activation and output with its weight, and rebuilds a request's full keys and
 values at any step from the new rows of its earlier steps:
@@ -258,6 +326,10 @@ for step in request.steps:
 
 for pair in dump.linear_pairs(phase="decode", layer=r"model\.layers\.0\."):
     tensors = dump.load_linear(pair)  # activation, weight, bias, output
+
+print(dump.attention_layers())  # by name, layers.2 before layers.10
+prefill = dump.phase_tensors(layer, request, "prefill")  # or the request's id
+# {"q": [prompt_len, Hq, D], "k": ..., "v": ..., "output": ...}
 ```
 
 - Tensors load on demand, and each is checked against the shape and dtype its
@@ -273,6 +345,12 @@ for pair in dump.linear_pairs(phase="decode", layer=r"model\.layers\.0\."):
   is loaded once.
 - `dump.requests()` raises `ValueError` when two requests cannot be told apart
   (see [Request boundaries](#request-boundaries)).
+- `dump.phase_tensors` returns a merged file's tensors as they are, and
+  builds the same tensors from the per-step files of a dump as written.
+- In a merged dump, a step's linear tensors are assembled from the files of
+  its requests, and exist only for steps whose every request was merged.
+- A file that cannot be read as a torch file raises `ValueError` naming it,
+  and so does a malformed manifest, with its line for `manifest.jsonl`.
 
 The record's `replay` fields give the scale, window, soft cap and causal
 offset to recompute the output with another attention implementation. A
@@ -424,10 +502,19 @@ pytest experimental/tensor_dump/tests
   unchanged, the dumped rows rebuild each request's keys and values, and every
   record replays to its dumped output.
 - `test_reader.py`: the reader on dumps the writer wrote over two appended
-  runs: runs and steps, request segmentation (a chunked prefill, requests in
-  sequence, two requests in one step, and ambiguous requests), linear pairs,
-  rebuilt keys and values at every step, missing history, and an fp32
-  recomputation of a windowed and a full layer.
+  runs, read as written and merged: runs and steps, request segmentation (a
+  chunked prefill, requests in sequence, two requests in one step, and
+  ambiguous requests), linear pairs, rebuilt keys and values at every step,
+  phase tensors, attention layers, missing history, unreadable files and
+  malformed manifests, and an fp32 recomputation of a windowed and a full
+  layer.
+- `test_merge.py`: merged files and manifest against the written tensors
+  and the reader (a chunked prefill, requests in sequence, two requests in
+  one step and a mixed step), the keys of a decode row as a slice, replay
+  fields that change between steps, deleting the source, a failed
+  verification deleting nothing unverified, re-verifying merged files before
+  a resumed merge deletes their source, resuming, an incomplete request, and
+  the command line and its thread cap.
 - `test_runtime.py`: runtime resolution selects `RUNTIME` from its entry point,
   which builds the dump executors and still parses built-in presets.
 - `test_import_boundary.py`: the package imports only public QuantSuite

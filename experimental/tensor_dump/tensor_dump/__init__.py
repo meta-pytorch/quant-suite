@@ -15,8 +15,12 @@
 Attention layers are recorded by forward hooks on vLLM's ``Attention`` layers,
 selected with environment variables.
 
-``tensor_dump.reader.TensorDump`` reads a dump back: steps, requests, linear
-operands, and attention inputs with each request's rebuilt key/value history.
+``tensor_dump.merge`` merges a dump into one file per request, phase and
+layer (``python -m tensor_dump.merge SRC DST``).
+
+``tensor_dump.reader.TensorDump`` reads a dump back, as written or merged:
+steps, requests, linear operands, and attention inputs with each request's
+rebuilt key/value history.
 """
 
 __version__ = "0.1.0"

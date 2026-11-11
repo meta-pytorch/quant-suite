@@ -7,7 +7,9 @@
 """Reads a dump directory: steps, requests, linear operands and attention
 inputs with their rebuilt key/value history.
 
-``TensorDump(path)`` parses every ``rank_<R>/manifest.jsonl`` under ``path``.
+``TensorDump(path)`` parses every ``rank_<R>/manifest.jsonl`` under ``path``,
+or, for a dump that ``tensor_dump.merge`` merged, every
+``rank_<R>/manifest.json``; both layouts are read through the same API.
 Tensors are loaded only when asked for, and each is checked against the shape
 and dtype its manifest entry records.
 """
@@ -15,21 +17,59 @@ and dtype its manifest entry records.
 from __future__ import annotations
 
 import json
+import pickle
 import re
 from collections import Counter, OrderedDict
 from collections.abc import Container, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 
 _FORMAT_VERSIONS: frozenset[int] = frozenset({2})
+_MERGED_FORMAT_VERSIONS: frozenset[int] = frozenset({1})
+_MANIFEST = "manifest.jsonl"
+_MERGED_MANIFEST = "manifest.json"
+_REQUEST_PHASES: tuple[str, ...] = ("prefill", "decode")
 _RANK_DIR_RE: re.Pattern[str] = re.compile(r"rank_([0-9]+)")
+_DIGITS_RE: re.Pattern[str] = re.compile(r"([0-9]+)")
+# Merged files a reader keeps loaded at once.
+_FILE_CACHE_SIZE = 4
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
+
+
+def _rank_dirs(root: Path, manifest: str) -> list[int]:
+    """The ranks ``R`` whose ``root/rank_<R>/<manifest>`` is a file, in order."""
+    ranks: list[int] = []
+    for child in root.iterdir() if root.is_dir() else []:
+        match = _RANK_DIR_RE.fullmatch(child.name)
+        if match is not None and (child / manifest).is_file():
+            ranks.append(int(match.group(1)))
+    return sorted(ranks)
+
+
+def _natural_key(name: str) -> tuple[str | int, ...]:
+    """Orders names with their digit runs compared as numbers."""
+    return tuple(
+        int(part) if index % 2 else part
+        for index, part in enumerate(_DIGITS_RE.split(name))
+    )
+
+
+def _torch_load(path: Path) -> object:
+    """``torch.load`` on the CPU, with only tensors and containers allowed.
+
+    Raises:
+        ValueError: if the file cannot be read as a torch file.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except (RuntimeError, pickle.UnpicklingError, EOFError) as error:
+        raise ValueError(f"{path} cannot be read as a torch file: {error}") from error
 
 
 def _load(ref: TensorRef | None) -> torch.Tensor | None:
@@ -60,11 +100,15 @@ class TensorRef:
         """The tensor, on the CPU.
 
         Raises:
-            ValueError: if the file holds another shape or dtype.
+            ValueError: if the file cannot be read, or holds another shape or
+                dtype.
         """
-        tensor = torch.load(self.path, map_location="cpu", weights_only=True)
+        tensor = _torch_load(self.path)
         if not isinstance(tensor, torch.Tensor):
             raise ValueError(f"{self.path} does not hold a tensor")
+        return self._checked(tensor)
+
+    def _checked(self, tensor: torch.Tensor) -> torch.Tensor:
         if tuple(tensor.shape) != self.shape or _dtype_name(tensor.dtype) != self.dtype:
             raise ValueError(
                 f"{self.path} holds {_dtype_name(tensor.dtype)} "
@@ -72,6 +116,69 @@ class TensorRef:
                 f"{self.dtype} {self.shape}"
             )
         return tensor
+
+
+class _FileCache:
+    """The merged files a reader loaded last, each a dict of tensors."""
+
+    def __init__(self) -> None:
+        self._files: OrderedDict[Path, dict[str, object]] = OrderedDict()
+
+    def tensor(self, path: Path, key: str) -> torch.Tensor:
+        """Tensor ``key`` of the dict in ``path``.
+
+        Raises:
+            ValueError: if the file cannot be read, or holds no tensor ``key``.
+        """
+        data = self._files.get(path)
+        if data is None:
+            loaded = _torch_load(path)
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{path} does not hold a dict of tensors")
+            data = loaded
+            self._files[path] = data
+            if len(self._files) > _FILE_CACHE_SIZE:
+                self._files.popitem(last=False)
+        else:
+            self._files.move_to_end(path)
+        tensor = data.get(key)
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"{path} holds no tensor {key!r}")
+        return tensor
+
+
+@dataclass(frozen=True)
+class _RowsRef(TensorRef):
+    """Rows of tensors in merged files, concatenated in order.
+
+    ``parts`` lists ``(file, key, start, stop)``: rows ``[start, stop)`` of
+    tensor ``key`` of the dict in ``file``, all rows for ``None`` bounds.
+    ``load`` returns a new tensor.
+    """
+
+    parts: tuple[tuple[Path, str, int | None, int | None], ...] = ()
+    cache: _FileCache = field(default_factory=_FileCache, compare=False, repr=False)
+
+    def load(self) -> torch.Tensor:
+        """The rows, on the CPU.
+
+        Raises:
+            ValueError: if a file cannot be read or lacks the tensor, or the
+                rows have another shape or dtype than recorded.
+        """
+        if not self.parts:
+            raise ValueError(f"no rows of {self.path} to load")
+        pieces = [
+            self.cache.tensor(path, key)[start:stop]
+            for path, key, start, stop in self.parts
+        ]
+        try:
+            tensor = torch.cat(pieces)
+        except RuntimeError as error:
+            raise ValueError(
+                f"the rows of {self.path} do not stack: {error}"
+            ) from error
+        return self._checked(tensor)
 
 
 @dataclass(frozen=True)
@@ -342,6 +449,18 @@ def _replay(data: Mapping[str, Any]) -> AttentionReplay:
     )
 
 
+def _layer_replay(entry: Mapping[str, Any], row: int) -> Mapping[str, Any]:
+    """A merged attention layer's per-layer replay fields at ``row``."""
+    replay = entry.get("replay")
+    if replay is not None:
+        return replay
+    for item in entry["replay_ranges"]:
+        start, stop = item["rows"]
+        if int(start) <= row < int(stop):
+            return item["replay"]
+    raise ValueError(f"no replay range of {entry['file']} holds row {row}")
+
+
 def _slice(step: int, data: Mapping[str, Any]) -> RequestSlice:
     return RequestSlice(
         step=step,
@@ -355,10 +474,17 @@ def _slice(step: int, data: Mapping[str, Any]) -> RequestSlice:
 
 
 class TensorDump:
-    """A dump directory written by ``tensor_dump``, possibly by several runs.
+    """A dump directory written by ``tensor_dump``, possibly by several runs,
+    or the merge of one that ``tensor_dump.merge`` wrote.
+
+    A directory that holds any ``rank_<R>/manifest.jsonl`` is read as written;
+    otherwise its ``rank_<R>/manifest.json`` are read as a merged dump. Both
+    give the same steps, requests and tensors. In a merged dump, a step's
+    linear tensors are assembled from the files of its requests, and only
+    for steps whose every request was merged.
 
     Args:
-        path: The dump directory, which holds ``rank_<R>/manifest.jsonl``.
+        path: The dump directory.
 
     Raises:
         ValueError: if ``path`` holds no manifest, or a manifest is malformed
@@ -375,15 +501,21 @@ class TensorDump:
         self._requests: dict[int, tuple[Request, ...]] = {}
         self._histories: OrderedDict[tuple[int, str, int], _History] = OrderedDict()
         self._weight_cache: tuple[tuple[int, str], LinearTensors] | None = None
-        ranks = []
-        for child in sorted(self.path.iterdir()) if self.path.is_dir() else []:
-            match = _RANK_DIR_RE.fullmatch(child.name)
-            if match is not None and (child / "manifest.jsonl").is_file():
-                ranks.append(int(match.group(1)))
-        if not ranks:
-            raise ValueError(f"{self.path} holds no rank_<R>/manifest.jsonl")
-        for rank in sorted(ranks):
-            self._read(rank, self.path / f"rank_{rank}")
+        self._files = _FileCache()
+        self._phase_files: dict[tuple[int, int, str, str], dict[str, TensorRef]] = {}
+        ranks = _rank_dirs(self.path, _MANIFEST)
+        merged = _rank_dirs(self.path, _MERGED_MANIFEST)
+        if ranks:
+            for rank in ranks:
+                self._read(rank, self.path / f"rank_{rank}")
+        elif merged:
+            for rank in merged:
+                self._read_merged(rank, self.path / f"rank_{rank}")
+        else:
+            raise ValueError(
+                f"{self.path} holds no rank_<R>/{_MANIFEST} or "
+                f"rank_<R>/{_MERGED_MANIFEST}"
+            )
         layers = len({key[:2] for key in self._attention})
         per_step = Counter(key[:3] for key in self._attention)
         self._history_limit = max(1, layers * max(per_step.values(), default=1))
@@ -521,6 +653,99 @@ class TensorDump:
             replay=record.replay,
         )
 
+    def phase_tensors(
+        self, layer: str, request: Request | int, phase: str, *, rank: int = 0
+    ) -> dict[str, torch.Tensor]:
+        """Every tensor ``layer`` wrote for ``request`` in ``phase``, its rows
+        of each step stacked along dim 0 in step order: linear ``input`` and
+        ``output``, attention ``q``, ``k``, ``v`` and ``output`` (``k`` and
+        ``v`` hold the new rows of each step, so the request's full keys at
+        a step are its rows of every step up to it).
+
+        Args:
+            layer: The layer.
+            request: A request, or its ``id`` among ``rank``'s requests.
+            phase: ``"prefill"`` or ``"decode"``.
+            rank: The rank of a request given by ``id``.
+
+        Raises:
+            KeyError: if the request has no rows of ``phase``, or ``layer``
+                wrote no record at one of its steps.
+            ValueError: for another phase, or tensors whose names, dtypes or
+                shapes differ between steps.
+        """
+        if isinstance(request, int):
+            request = self._request(rank, request)
+        if phase not in _REQUEST_PHASES:
+            raise ValueError(f"phase {phase!r} is not one of {_REQUEST_PHASES}")
+        merged = self._phase_files.get((request.rank, request.id, phase, layer))
+        if merged is not None:
+            return {name: ref.load() for name, ref in sorted(merged.items())}
+        slices = [piece for piece in request.slices if piece.phase == phase]
+        if not slices:
+            raise KeyError(f"request {request.id} has no {phase} rows")
+        parts: dict[str, list[torch.Tensor]] = {}
+        for piece in slices:
+            tensors = self._slice_tensors(layer, request, piece)
+            if parts and sorted(tensors) != sorted(parts):
+                raise ValueError(
+                    f"layer {layer!r} wrote {sorted(tensors)} at step "
+                    f"{piece.step} but {sorted(parts)} at an earlier step"
+                )
+            for name, tensor in tensors.items():
+                parts.setdefault(name, []).append(tensor)
+        try:
+            return {name: torch.cat(pieces) for name, pieces in sorted(parts.items())}
+        except RuntimeError as error:
+            raise ValueError(
+                f"the tensors of layer {layer!r} differ between steps: {error}"
+            ) from error
+
+    def attention_layers(self, *, rank: int = 0) -> tuple[str, ...]:
+        """The attention layers with records on ``rank``, ordered by name with
+        digit runs compared as numbers (``layers.2`` before ``layers.10``)."""
+        self._runs_of(rank)
+        names = {layer for (owner, layer, _, _) in self._attention if owner == rank}
+        return tuple(sorted(names, key=_natural_key))
+
+    def _attention_records(
+        self, rank: int
+    ) -> Iterator[tuple[str, int, int, Mapping[str, TensorRef]]]:
+        """``(layer, step, request, tensors)`` of each of ``rank``'s attention
+        records, ``request`` being the index in the step's batch."""
+        for (owner, layer, step, request), record in self._attention.items():
+            if owner == rank:
+                yield layer, step, request, record.tensors
+
+    def _weight_refs(self, rank: int) -> dict[str, Mapping[str, TensorRef]]:
+        """``rank``'s weight files per layer."""
+        return {
+            layer: refs
+            for (owner, layer), refs in self._weights.items()
+            if owner == rank
+        }
+
+    def _request(self, rank: int, request: int) -> Request:
+        for candidate in self.requests(rank=rank):
+            if candidate.id == request:
+                return candidate
+        raise KeyError(f"rank {rank} has no request {request}")
+
+    def _slice_tensors(
+        self, layer: str, request: Request, piece: RequestSlice
+    ) -> dict[str, torch.Tensor]:
+        linear = self._linear.get((request.rank, layer, piece.step))
+        if linear is not None:
+            rows = slice(piece.token_start, piece.token_start + piece.q_len)
+            return {name: ref.load()[rows] for name, ref in linear.items()}
+        record = self._attention.get((request.rank, layer, piece.step, piece.request))
+        if record is not None:
+            return {name: ref.load() for name, ref in record.tensors.items()}
+        raise KeyError(
+            f"layer {layer!r} wrote no record for request {request.id} at step "
+            f"{piece.step}"
+        )
+
     def _runs_of(self, rank: int) -> list[Run]:
         runs = self._runs.get(rank)
         if runs is None:
@@ -594,6 +819,176 @@ class TensorDump:
             self._attention[key] = _AttentionRecord(
                 _entries(root, record), _replay(record["replay"])
             )
+
+    def _read_merged(self, rank: int, root: Path) -> None:
+        path = root / _MERGED_MANIFEST
+        try:
+            self._merged_manifest(rank, root, json.loads(path.read_text("utf-8")))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"{path} is not a valid merged manifest: {error!r}"
+            ) from error
+
+    def _merged_manifest(
+        self, rank: int, root: Path, manifest: Mapping[str, Any]
+    ) -> None:
+        version = manifest["merged_format_version"]
+        if version not in _MERGED_FORMAT_VERSIONS:
+            raise ValueError(
+                f"{root} holds a dump in merged format {version}; this reader "
+                f"reads merged formats {sorted(_MERGED_FORMAT_VERSIONS)}"
+            )
+        self._runs[rank] = [
+            Run(
+                rank=rank,
+                run=int(record["run"]),
+                first_step=int(record["first_step"]),
+                options=dict(record["options"]),
+            )
+            for record in manifest["runs"]
+        ]
+        steps: dict[int, Step] = {}
+        for record in manifest["steps"]:
+            step = int(record["step"])
+            steps[step] = Step(
+                rank=rank,
+                run=int(record["run"]),
+                step=step,
+                phase=str(record["phase"]),
+                num_actual_tokens=int(record["num_actual_tokens"]),
+                requests=tuple(_slice(step, data) for data in record["requests"]),
+            )
+        self._steps[rank] = dict(sorted(steps.items()))
+        for layer, entry in manifest["weights"].items():
+            weights: dict[str, TensorRef] = {
+                str(name): self._rows_ref(root / str(entry["file"]), name, data, None)
+                for name, data in entry["tensors"].items()
+            }
+            self._weights[(rank, str(layer))] = weights
+        linear: dict[tuple[str, int], list[tuple[int, dict[str, _RowsRef]]]] = {}
+        requests = []
+        for entry in manifest["requests"]:
+            request = int(entry["request"])
+            slices: list[RequestSlice] = []
+            for phase, data in entry["phases"].items():
+                segments = data["segments"]
+                for segment in segments:
+                    slices.append(
+                        _slice(int(segment["step"]), {**segment, "phase": phase})
+                    )
+                for layer, layer_entry in data["layers"].items():
+                    key = (rank, request, str(phase), str(layer))
+                    self._merged_layer(root, key, layer_entry, segments, linear)
+            requests.append(
+                Request(
+                    rank=rank,
+                    run=int(entry["run"]),
+                    id=request,
+                    slices=tuple(sorted(slices, key=lambda piece: piece.step)),
+                )
+            )
+        self._requests[rank] = tuple(sorted(requests, key=lambda r: r.id))
+        self._merged_linear(rank, steps, linear)
+
+    def _rows_ref(
+        self,
+        file: Path,
+        name: object,
+        data: Mapping[str, Any],
+        rows: tuple[int, int] | None,
+    ) -> _RowsRef:
+        shape = tuple(int(n) for n in data["shape"])
+        start: int | None = None
+        stop: int | None = None
+        if rows is not None:
+            start, stop = rows
+            shape = (stop - start, *shape[1:])
+        checksum = data.get("sha256")
+        return _RowsRef(
+            path=file,
+            shape=shape,
+            dtype=str(data["dtype"]),
+            sha256=None if checksum is None else str(checksum),
+            parts=((file, str(name), start, stop),),
+            cache=self._files,
+        )
+
+    def _merged_layer(
+        self,
+        root: Path,
+        key: tuple[int, int, str, str],
+        entry: Mapping[str, Any],
+        segments: list[Mapping[str, Any]],
+        linear: dict[tuple[str, int], list[tuple[int, dict[str, _RowsRef]]]],
+    ) -> None:
+        """Index one merged file by step, as the per-step records would be."""
+        rank, _, _, layer = key
+        file = root / str(entry["file"])
+        tensors = entry["tensors"]
+        self._phase_files[key] = {
+            str(name): self._rows_ref(file, name, data, None)
+            for name, data in tensors.items()
+        }
+        kind = entry["kind"]
+        if kind not in ("linear", "attention"):
+            raise ValueError(f"{file} holds a layer of kind {kind!r}")
+        for segment in segments:
+            start = int(segment["row_start"])
+            rows = (start, start + int(segment["q_len"]))
+            step = int(segment["step"])
+            refs = {
+                str(name): self._rows_ref(file, name, data, rows)
+                for name, data in tensors.items()
+            }
+            if kind == "linear":
+                linear.setdefault((layer, step), []).append(
+                    (int(segment["token_start"]), refs)
+                )
+                continue
+            replay = {
+                **_layer_replay(entry, start),
+                "q_start_pos": segment["q_start_pos"],
+                "q_len": segment["q_len"],
+                "kv_len": segment["kv_len"],
+            }
+            record_key = (rank, layer, step, int(segment["request"]))
+            self._attention[record_key] = _AttentionRecord(refs, _replay(replay))
+
+    def _merged_linear(
+        self,
+        rank: int,
+        steps: Mapping[int, Step],
+        linear: Mapping[tuple[str, int], list[tuple[int, dict[str, _RowsRef]]]],
+    ) -> None:
+        """A step's linear records: its requests' rows in row order, for
+        steps whose requests' files cover every row."""
+        for (layer, step), pieces in linear.items():
+            written = steps.get(step)
+            if written is None or len(pieces) != len(written.requests):
+                continue
+            pieces = sorted(pieces, key=lambda piece: piece[0])
+            names = sorted(pieces[0][1])
+            end = 0
+            for token_start, refs in pieces:
+                if not names or token_start != end or sorted(refs) != names:
+                    end = -1
+                    break
+                end += refs[names[0]].shape[0]
+            if end != written.num_actual_tokens:
+                continue
+            tensors: dict[str, TensorRef] = {}
+            for name in names:
+                first = pieces[0][1][name]
+                tensors[name] = _RowsRef(
+                    path=first.path,
+                    shape=(end, *first.shape[1:]),
+                    dtype=first.dtype,
+                    parts=tuple(
+                        part for _, refs in pieces for part in refs[name].parts
+                    ),
+                    cache=self._files,
+                )
+            self._linear[(rank, layer, step)] = tensors
 
     def _pair(self, rank: int, layer: str, step: int) -> LinearPair:
         tensors = self._linear[(rank, layer, step)]

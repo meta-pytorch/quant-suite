@@ -52,6 +52,7 @@ _ALLOWED_VLLM_MODULES: frozenset[str] = frozenset(
 _OTHER_ALLOWED_ROOTS: frozenset[str] = frozenset(
     {
         "__future__",
+        "argparse",
         "collections",
         "dataclasses",
         "hashlib",
@@ -60,6 +61,7 @@ _OTHER_ALLOWED_ROOTS: frozenset[str] = frozenset(
         "logging",
         "os",
         "pathlib",
+        "pickle",
         "re",
         "torch",
         "types",

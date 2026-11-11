@@ -6,8 +6,10 @@
 
 """``tensor_dump.reader`` on dumps the writer wrote: two runs into one
 directory, with a chunked prefill, decodes, requests in sequence and two
-requests in one step. CPU only."""
+requests in one step. Every test reads the dump as written and, in
+``MergedReaderTest``, after ``tensor_dump.merge`` merged it. CPU only."""
 
+import dataclasses
 import json
 import tempfile
 import unittest
@@ -20,9 +22,12 @@ from dump_test_utils import dump_session, FakeAttention, generic_metadata
 from quant_suite_recipe.api import QuantizedTensor
 from quant_suite_recipe.definition import PipelineRecipe, QuantLinearRecipe
 from tensor_dump._writer import _FORMAT_VERSION
+from tensor_dump.merge import _MERGED_FORMAT_VERSION, merge
 from tensor_dump.reader import (
     _FORMAT_VERSIONS,
     _History,
+    _MERGED_FORMAT_VERSIONS,
+    _natural_key,
     _reference_attention,
     Request,
     TensorDump,
@@ -52,6 +57,7 @@ _SECOND_RUN: list[tuple[list[str], list[int], list[int]]] = [
     (["c", "d"], [1, 1], [5, 2]),
     (["d"], [1], [3]),
 ]
+_HEADS_OF = {"q": _HEADS, "k": _KV_HEADS, "v": _KV_HEADS, "output": _HEADS}
 
 
 class _CausalAttention(FakeAttention):
@@ -194,7 +200,11 @@ class ReaderTest(unittest.TestCase):
         first = _write(self.directory, _FIRST_RUN, self.weight, self.bias)
         second = _write(self.directory, _SECOND_RUN, self.weight, self.bias)
         self.written = first + second
-        self.dump = TensorDump(self.directory)
+        self.dump = self._open(self.directory)
+
+    def _open(self, directory: Path) -> TensorDump:
+        """The dump in ``directory``, in the layout the test case reads."""
+        return TensorDump(directory)
 
     def _request(self, name: str) -> Request:
         index = "abcd".index(name)
@@ -365,7 +375,7 @@ class ReaderTest(unittest.TestCase):
     def test_missing_history_raises(self) -> None:
         directory = Path(tempfile.mkdtemp())
         _write(directory, _FIRST_RUN, self.weight, self.bias, STEPS="1:")
-        dump = TensorDump(directory)
+        dump = self._open(directory)
         first = dump.requests()[0]
         self.assertFalse(first.complete)
         self.assertEqual(first.steps, (1, 2, 3))
@@ -376,13 +386,13 @@ class ReaderTest(unittest.TestCase):
         _write(
             directory, _FIRST_RUN, self.weight, self.bias, ATTENTION_TENSORS="q,output"
         )
-        dump = TensorDump(directory)
+        dump = self._open(directory)
         with self.assertRaisesRegex(ValueError, "wrote no k and v"):
             dump.attention(_FULL, dump.requests()[0], 1)
 
         directory = Path(tempfile.mkdtemp())
         _write(directory, _FIRST_RUN, self.weight, self.bias, ATTENTION=_WINDOWED)
-        dump = TensorDump(directory)
+        dump = self._open(directory)
         with self.assertRaises(KeyError):
             dump.attention(_FULL, dump.requests()[0], 0)
 
@@ -391,7 +401,7 @@ class ReaderTest(unittest.TestCase):
         schedule = [(["e", "f"], [2, 2], [0, 0]), (["e", "f"], [1, 1], [2, 2])]
         _write(directory, schedule, self.weight, self.bias)
         with self.assertRaisesRegex(ValueError, "cannot be told apart"):
-            TensorDump(directory).requests()
+            self._open(directory).requests()
 
     def test_unsupported_format_raises(self) -> None:
         self.assertEqual(_FORMAT_VERSIONS, frozenset({_FORMAT_VERSION}))
@@ -439,9 +449,137 @@ class ReaderTest(unittest.TestCase):
         pair = next(self.dump.linear_pairs(steps={0}))
         activation = pair.activation
         assert activation is not None
-        tampered = type(activation)(activation.path, (99,), activation.dtype)
+        tampered = dataclasses.replace(activation, shape=(99,))
         with self.assertRaisesRegex(ValueError, "manifest entry records"):
             tampered.load()
+
+    def test_unreadable_file_raises_on_load(self) -> None:
+        pair = next(self.dump.linear_pairs(steps={0}))
+        activation = pair.activation
+        assert activation is not None
+        original = activation.path.read_bytes()
+        for content in (b"not a torch file", original[: len(original) // 2], b""):
+            with self.subTest(size=len(content)):
+                activation.path.write_bytes(content)
+                with self.assertRaisesRegex(
+                    ValueError, f"{activation.path}.*cannot be read as a torch file"
+                ):
+                    activation.load()
+
+    def test_phase_tensors_stack_each_phase_in_step_order(self) -> None:
+        for request in self.dump.requests():
+            name = "abcd"[request.id]
+            for phase in ("prefill", "decode"):
+                steps = [
+                    (self.written[piece.step], piece)
+                    for piece in request.slices
+                    if piece.phase == phase
+                ]
+                linear = self.dump.phase_tensors(_LINEAR, request, phase)
+                self.assertEqual(sorted(linear), ["input", "output"])
+                inputs = [_rows(step, name, step.inputs["x"]) for step, _ in steps]
+                outputs = [
+                    _rows(step, name, step.outputs["linear"]) for step, _ in steps
+                ]
+                self.assertTrue(torch.equal(linear["input"], torch.cat(inputs)))
+                self.assertTrue(torch.equal(linear["output"], torch.cat(outputs)))
+                for layer in (_FULL, _WINDOWED):
+                    with self.subTest(request=name, phase=phase, layer=layer):
+                        tensors = self.dump.phase_tensors(
+                            layer, request.id, phase, rank=0
+                        )
+                        self.assertEqual(sorted(tensors), ["k", "output", "q", "v"])
+                        for key, tensor in tensors.items():
+                            rows = [
+                                _rows(
+                                    step,
+                                    name,
+                                    step.outputs[layer]
+                                    if key == "output"
+                                    else step.inputs[key],
+                                )
+                                for step, _ in steps
+                            ]
+                            expected = torch.cat(rows).view(
+                                -1, _HEADS_OF[key], _HEAD_SIZE
+                            )
+                            self.assertTrue(torch.equal(tensor, expected))
+                        self.assertEqual(
+                            tensors["q"].shape[0], sum(p.q_len for _, p in steps)
+                        )
+        with self.assertRaises(KeyError):
+            self.dump.phase_tensors(_FULL, 99, "prefill")
+        with self.assertRaisesRegex(ValueError, "mixed"):
+            self.dump.phase_tensors(_FULL, 0, "mixed")
+
+    def test_full_keys_are_the_phase_rows_up_to_a_step(self) -> None:
+        request = self._request("a")
+        prefill = self.dump.phase_tensors(_FULL, request, "prefill")
+        decode = self.dump.phase_tensors(_FULL, request, "decode")
+        decodes = [piece.step for piece in request.slices if piece.phase == "decode"]
+        for row, step in enumerate(decodes):
+            tensors = self.dump.attention(_FULL, request, step)
+            for key in ("k", "v"):
+                full = torch.cat([prefill[key], decode[key][: row + 1]])
+                self.assertTrue(torch.equal(full, getattr(tensors, key)))
+
+    def test_attention_layers(self) -> None:
+        self.assertEqual(self.dump.attention_layers(), (_FULL, _WINDOWED))
+        self.assertEqual(self.dump.attention_layers(rank=0), (_FULL, _WINDOWED))
+        with self.assertRaises(KeyError):
+            self.dump.attention_layers(rank=1)
+        names = ["layers.10.attn", "layers.2.attn", "layers.1.attn"]
+        self.assertEqual(
+            sorted(names, key=_natural_key),
+            ["layers.1.attn", "layers.2.attn", "layers.10.attn"],
+        )
+
+
+class MergedReaderTest(ReaderTest):
+    """The same reads on the merged dump, its per-step files deleted."""
+
+    def _open(self, directory: Path) -> TensorDump:
+        merged = directory.with_name(directory.name + "_merged")
+        merge(directory, merged, delete_source=True)
+        self.assertFalse((directory / "rank_0").exists())
+        return TensorDump(merged)
+
+    def _manifest(self) -> Path:
+        return self.directory.with_name(self.directory.name + "_merged") / (
+            "rank_0/manifest.json"
+        )
+
+    def test_unsupported_format_raises(self) -> None:
+        self.assertEqual(_MERGED_FORMAT_VERSIONS, frozenset({_MERGED_FORMAT_VERSION}))
+        manifest = json.loads(self._manifest().read_text())
+        manifest["merged_format_version"] = 9
+        self._manifest().write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "merged format 9"):
+            TensorDump(self._manifest().parents[1])
+
+    def test_malformed_field_raises_with_its_line(self) -> None:
+        manifest = json.loads(self._manifest().read_text())
+        manifest["steps"][0]["num_actual_tokens"] = "many"
+        self._manifest().write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(
+            ValueError, f"{self._manifest()} is not a valid merged manifest"
+        ):
+            TensorDump(self._manifest().parents[1])
+
+    def test_kv_len_that_disagrees_with_the_history_raises(self) -> None:
+        manifest = json.loads(self._manifest().read_text())
+        entry = next(r for r in manifest["requests"] if r["request"] == 0)
+        segments = entry["phases"]["decode"]["segments"]
+        segment = next(s for s in segments if s["step"] == 3)
+        self.assertEqual(segment["kv_len"], 8)
+        segment["kv_len"] = 9
+        self._manifest().write_text(json.dumps(manifest))
+        dump = TensorDump(self._manifest().parents[1])
+        request = dump.requests()[0]
+        self.assertEqual(request.steps, (0, 1, 2, 3))
+        dump.attention(_FULL, request, 2)
+        with self.assertRaisesRegex(ValueError, "kv_len 9 at step 3.* rebuilds 8 rows"):
+            dump.attention(_FULL, request, 3)
 
 
 if __name__ == "__main__":
