@@ -1,0 +1,29 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Records the input, weight and output of the first decoder layer's linear
+# layers, the input and output of every other linear layer, and the Q, K, V
+# and output of every attention layer. No tensor is quantized, so the model
+# computes exactly what the no_quant recipe computes. Both sections are
+# needed: a model without linear_recipe or attention_recipe never reaches the
+# corresponding QuantSuite executor. See ../../README.md for the launch
+# command and the environment variables.
+
+linear_recipe:
+  '^model\.layers\.0\.':
+    activation:
+      type: dump
+      tensors: [input, weight, output]
+  '.*':
+    activation:
+      type: dump
+      tensors: [input, output]
+
+attention_recipe:
+  '.*':
+    q:
+      type: dump
+      tensors: [q, k, v, output]

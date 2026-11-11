@@ -6,6 +6,7 @@ its public extension points but are not part of the supported packages.
 | package | algorithm | source |
 | --- | --- | --- |
 | [`mx_plus/`](mx_plus/) (`mx_plus`, dist `quant_suite_mx_plus`) | MX+: extra mantissa bits on each block's largest element | Lee et al., MICRO '25 |
+| [`tensor_dump/`](tensor_dump/) (`tensor_dump`, dist `quant_suite_tensor_dump`) | Records linear and attention GEMM operands and outputs for offline analysis and attention replay | none (a tool) |
 
 ## Policy
 
