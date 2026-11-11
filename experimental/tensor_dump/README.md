@@ -3,6 +3,8 @@
 > Experimental. No API, numerics or serialization guarantees; see
 > [`../README.md`](../README.md).
 
+For a step-by-step guide to collecting dumps, see [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
+
 `tensor_dump` (distribution `quant_suite_tensor_dump`) records the operands and
 results of a QuantSuite model's linear layers, and the inputs and output of its
 attention layers, while vLLM runs it, so they can be analysed offline. The
@@ -104,8 +106,9 @@ without attention metadata, such as the profiling and warmup runs of
 vLLM's V1 model runner, get no step id and are never written. The V2 model
 runner warms up with real forwards that carry attention metadata and cannot be
 told apart from requests, so the dump refuses to start under it: launch vLLM
-with `VLLM_USE_V2_MODEL_RUNNER=0`, which selects the V1 runner. All ranks of a tensor- or pipeline-parallel group run the same
-forwards, so their step ids agree; ranks that do not write still count steps.
+with `VLLM_USE_V2_MODEL_RUNNER=0`, which selects the V1 runner. All ranks of a
+tensor- or pipeline-parallel group run the same forwards, so their step ids
+agree; ranks that do not write still count steps.
 
 The requests of a step come from the attention metadata's `query_start_loc`
 and `seq_lens`, so recording either kind of layer needs an attention backend
@@ -277,8 +280,11 @@ alone. For each rank:
 - Per request it also records `prompt_len`, `generated_len`,
   `starts_at_zero` (its first step is in the dump), `may_continue` (its run
   did not write the next step, and a step filter, `MAX_STEPS` or the byte
-  budget would have left that step out) and `complete` (the first and not
-  the second). Incomplete requests are merged like the others.
+  budget would have left that step out) and `complete` (`starts_at_zero` and
+  not `may_continue`: the dump holds the request from position 0, and
+  nothing the dump options left out could have continued it). The reader's
+  `Request.complete` is `starts_at_zero` only. Incomplete requests are
+  merged like the others.
 - Each merged file is read back and compared bit for bit with the tensors it
   was made from before the manifest lists it; a difference raises
   `RuntimeError`.
@@ -294,8 +300,9 @@ alone. For each rank:
 - A merge that stops part way resumes when run again with the same
   arguments: requests and weights the destination manifest lists are checked
   against the dump and skipped. A run appended to the dump after a merge
-  adds its requests on the next merge. Memory holds about one request's
-  tensors of one layer at a time.
+  adds its requests on the next merge. Memory holds one request's tensors
+  of one layer at a time, plus an index of the dump's manifest that grows
+  with its number of records.
 
 ### Reading a dump
 
@@ -459,8 +466,11 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
 - Weights are recorded as registered: unquantized or fake-quantized. Natively
   quantized weights raise `NotImplementedError`.
 - Step ids agree across tensor- and pipeline-parallel ranks, not across
-  data-parallel ranks, which schedule independently. Requests cannot be linked
-  across steps: `request` is an index within one step.
+  data-parallel ranks, which schedule independently.
+- Requests carry no ids. They are linked across steps when each step holds
+  one request (see [Request boundaries](#request-boundaries)); when several
+  requests share a step, `request` is only an index within that step and
+  identifies no request across steps.
 - vLLM's V1 model runner only (`VLLM_USE_V2_MODEL_RUNNER=0`); the V2 model
   runner raises at startup.
 - Speculative decoding raises at startup, and dual-batch overlap at the first

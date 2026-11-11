@@ -269,8 +269,15 @@ class Request:
 
     @property
     def complete(self) -> bool:
-        """Whether the request's first step is in the dump, i.e. its first
-        slice starts at position 0."""
+        """Whether the request's first step is in the dump: its first slice
+        starts at position 0, so its keys and values can be rebuilt from
+        position 0.
+
+        It says nothing about the request's end: the dump may have stopped
+        writing before the request's last step. The ``complete`` field of a
+        merged manifest (see ``tensor_dump.merge``) is stricter: it is this
+        and, in addition, not ``may_continue``.
+        """
         return self.slices[0].q_start_pos == 0
 
     @property
@@ -280,9 +287,14 @@ class Request:
 
     @property
     def generated_len(self) -> int:
-        """Decode steps of the request: the generated tokens fed back as
-        inputs. The last generated token is never an input, so a request that
-        ran to completion generated one more."""
+        """Written decode steps of the request: the generated tokens fed back
+        as inputs.
+
+        For a request written to its end, this equals the number of generated
+        tokens when the engine runs one more forward that feeds back the final
+        token, as asynchronous scheduling can; otherwise the final token is
+        never an input, and the request generated one more token than this.
+        """
         return sum(1 for piece in self.slices if piece.phase == "decode")
 
 

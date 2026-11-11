@@ -38,10 +38,14 @@ decode rows has the full keys of its ``i``-th decode row in
   wrote it at, and ``tensors``: ``shape``, ``dtype`` and ``sha256`` of each;
 - ``requests``: per request, ``request``, ``run``, ``steps``,
   ``prompt_len``, ``generated_len``, ``starts_at_zero`` (its first step is
-  in the dump), ``may_continue`` (the dump may have stopped writing before
-  its last step: its run did not write the next step, and a step filter, the
-  step cap or the byte budget would have left that step out), ``complete``
-  (``starts_at_zero`` and not ``may_continue``), ``prefill_before_decode``,
+  in the dump; this is ``tensor_dump.reader.Request.complete``),
+  ``may_continue`` (the dump may have stopped writing before its last step:
+  its run did not write the next step, and a step filter, the step cap or
+  the byte budget would have left that step out), ``complete``
+  (``starts_at_zero`` and not ``may_continue``: the dump holds the request
+  from position 0, and nothing the dump options left out could have
+  continued it; stricter than ``Request.complete``),
+  ``prefill_before_decode``,
   and ``phases``, which maps each phase to:
 
   - ``rows``: ``T``;
