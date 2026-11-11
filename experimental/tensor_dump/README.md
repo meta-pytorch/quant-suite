@@ -232,51 +232,71 @@ A step that starts below the budget is written whole, so the directory can
 end up over the budget by up to one step; a long prefill step of a large
 model can be tens of GB. Ranks count only their own directory.
 
-### Replaying an attention record
+### Reading a dump
 
-`k` and `v` of one record hold only that step's new rows, so the full keys and
-values of a request are rebuilt from its records at this step and the steps
-before. With one request per step, they are the records of the same layer
-from the request's first step (`q_start_pos == 0`) on:
+`tensor_dump.reader.TensorDump` reads a dump directory, all runs and ranks
+included. It follows requests across steps by the rules of
+[Request boundaries](#request-boundaries), pairs each linear layer's
+activation and output with its weight, and rebuilds a request's full keys and
+values at any step from the new rows of its earlier steps:
 
 ```python
-import json
-from pathlib import Path
+from tensor_dump.reader import TensorDump
 
-import torch
-import torch.nn.functional as F
+dump = TensorDump("/tmp/llama31_8b_dump")
+for step in dump.steps():
+    print(step.step, step.phase, [(r.q_start_pos, r.q_len) for r in step.requests])
 
-root = Path("/tmp/llama31_8b_dump/rank_0")
-records = [json.loads(line) for line in (root / "manifest.jsonl").open()]
+request = dump.requests()[0]
+print(request.prompt_len, request.generated_len, request.steps)
+
 layer = "model.layers.0.self_attn.attn"
-history = [r for r in records if r["record"] == "attention" and r["layer"] == layer]
-record = history[-1]
-replay = record["replay"]
-first = max(i for i, r in enumerate(history) if r["replay"]["q_start_pos"] == 0)
+for step in request.steps:
+    attention = dump.attention(layer, request, step)
+    # attention.q: [q_len, Hq, D]; attention.k, attention.v: [kv_len, Hkv, D]
+    print(step, attention.replay.q_start_pos, attention.k.shape)
 
+for pair in dump.linear_pairs(phase="decode", layer=r"model\.layers\.0\."):
+    tensors = dump.load_linear(pair)  # activation, weight, bias, output
+```
 
-def load(r, name):
-    return torch.load(root / r["tensors"][name]["file"]).float()
+- Tensors load on demand, and each is checked against the shape and dtype its
+  manifest entry records.
+- `dump.attention` raises `ValueError` when part of the history is missing:
+  the request's first steps were not written (it starts after position 0), or
+  one of its steps has no `k` and `v` for the layer.
+- The rebuilt history is cached per layer and request until the request's last
+  step is read, so reading a request's steps in order costs time linear in its
+  length.
+- `dump.load_linear` keeps the weight of the last layer it loaded;
+  `linear_pairs` yields pairs ordered by rank, layer and step, so each weight
+  is loaded once.
+- `dump.requests()` raises `ValueError` when two requests cannot be told apart
+  (see [Request boundaries](#request-boundaries)).
 
+The record's `replay` fields give the scale, window, soft cap and causal
+offset to recompute the output with another attention implementation. A
+plain fp32 recomputation:
 
-k = torch.cat([load(r, "k") for r in history[first:]])
-v = torch.cat([load(r, "v") for r in history[first:]])
-q, expected = load(record, "q"), load(record, "output")
+```python
+import torch
 
-group = replay["num_q_heads"] // replay["num_kv_heads"]
-query_pos = torch.arange(replay["q_len"])[:, None] + replay["q_start_pos"]
-key_pos = torch.arange(replay["kv_len"])
+a = dump.attention(layer, request, request.steps[-1])
+r = a.replay
+group = r.num_q_heads // r.num_kv_heads
+query_pos = torch.arange(r.q_len)[:, None] + r.q_start_pos
+key_pos = torch.arange(r.kv_len)
 mask = key_pos <= query_pos
-if replay["sliding_window"] is not None:
-    mask &= key_pos > query_pos - replay["sliding_window"]
-output = F.scaled_dot_product_attention(
-    q.transpose(0, 1),
-    k.repeat_interleave(group, dim=1).transpose(0, 1),
-    v.repeat_interleave(group, dim=1).transpose(0, 1),
+if r.sliding_window is not None:
+    mask &= key_pos > query_pos - r.sliding_window
+output = torch.nn.functional.scaled_dot_product_attention(
+    a.q.float().transpose(0, 1),
+    a.k.float().repeat_interleave(group, dim=1).transpose(0, 1),
+    a.v.float().repeat_interleave(group, dim=1).transpose(0, 1),
     attn_mask=mask,
-    scale=replay["scale"],
+    scale=r.scale,
 ).transpose(0, 1)
-print((output - expected).abs().max())
+print((output - a.output.float()).abs().max())
 ```
 
 ## Install
@@ -403,6 +423,11 @@ pytest experimental/tensor_dump/tests
   sliding window, once inside vLLM's own forward context; the outputs are
   unchanged, the dumped rows rebuild each request's keys and values, and every
   record replays to its dumped output.
+- `test_reader.py`: the reader on dumps the writer wrote over two appended
+  runs: runs and steps, request segmentation (a chunked prefill, requests in
+  sequence, two requests in one step, and ambiguous requests), linear pairs,
+  rebuilt keys and values at every step, missing history, and an fp32
+  recomputation of a windowed and a full layer.
 - `test_runtime.py`: runtime resolution selects `RUNTIME` from its entry point,
   which builds the dump executors and still parses built-in presets.
 - `test_import_boundary.py`: the package imports only public QuantSuite
