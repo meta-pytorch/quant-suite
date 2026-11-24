@@ -290,10 +290,8 @@ class Request:
         """Written decode steps of the request: the generated tokens fed back
         as inputs.
 
-        For a request written to its end, this equals the number of generated
-        tokens when the engine runs one more forward that feeds back the final
-        token, as asynchronous scheduling can; otherwise the final token is
-        never an input, and the request generated one more token than this.
+        For a request written to its end, the final token is never an input,
+        so the request generated one more token than this.
         """
         return sum(1 for piece in self.slices if piece.phase == "decode")
 

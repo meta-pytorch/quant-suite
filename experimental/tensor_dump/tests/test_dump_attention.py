@@ -11,13 +11,13 @@ import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import torch
 from dump_test_utils import (
     dump_session,
     fake_metadata,
+    fake_vllm_config,
     FakeAttention,
     flashinfer_metadata,
     generic_metadata,
@@ -356,13 +356,7 @@ class DumpAttentionTest(unittest.TestCase):
 
     def test_prefix_caching_is_read_from_the_config(self) -> None:
         for enabled in (True, False):
-            config = SimpleNamespace(
-                use_v2_model_runner=False,
-                speculative_config=None,
-                cache_config=SimpleNamespace(
-                    enable_prefix_caching=enabled, cache_dtype="auto"
-                ),
-            )
+            config = fake_vllm_config(enable_prefix_caching=enabled)
             self.assertEqual(_settings_from(config, None).prefix_caching, enabled)
         self.assertIsNone(_settings_from(None, None).prefix_caching)
 
@@ -390,13 +384,7 @@ class DumpAttentionTest(unittest.TestCase):
                 self.assertEqual(len(_records(directory)), len(_LAYERS))
 
     def test_kv_cache_dtype_is_read_from_the_config(self) -> None:
-        config = SimpleNamespace(
-            use_v2_model_runner=False,
-            speculative_config=None,
-            cache_config=SimpleNamespace(
-                enable_prefix_caching=False, cache_dtype="fp8_e4m3"
-            ),
-        )
+        config = fake_vllm_config(cache_dtype="fp8_e4m3")
         self.assertEqual(_settings_from(config, None).kv_cache_dtype, "fp8_e4m3")
         self.assertIsNone(_settings_from(None, None).kv_cache_dtype)
 

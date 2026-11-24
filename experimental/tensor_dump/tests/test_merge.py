@@ -10,6 +10,7 @@ in one step and a mixed step. CPU only."""
 
 import io
 import json
+import re
 import shutil
 import tempfile
 import unittest
@@ -486,6 +487,28 @@ class MergeTest(unittest.TestCase):
         path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records))
         with self.assertRaisesRegex(ValueError, "max_bytes=1.5"):
             merge(self.source, self.destination)
+
+    def test_incomplete_step_is_named(self) -> None:
+        # Request a's last step keeps the record of one linear layer only, as a
+        # forward cut short leaves it.
+        path = self.source / "rank_0" / "manifest.jsonl"
+        records = [
+            record
+            for record in map(json.loads, path.read_text().splitlines())
+            if not (
+                record["record"] == "linear"
+                and record["step"] == 3
+                and record["layer"] == _LINEARS[1]
+            )
+        ]
+        path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records))
+        expected = re.escape(
+            "request 0: step 3 is incomplete: it holds linear records of 1 of "
+            f"the 2 layers recorded at step 2 (missing {_LINEARS[1]})."
+        )
+        with self.assertRaisesRegex(ValueError, expected) as raised:
+            merge(self.source, self.destination)
+        self.assertIn("--no-async-scheduling", str(raised.exception))
 
     def test_delete_source_removes_the_merged_dump(self) -> None:
         merge(self.source, self.destination, delete_source=True)

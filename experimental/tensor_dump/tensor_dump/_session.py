@@ -39,10 +39,11 @@ class _Session:
     MoE hooks of one process.
 
     Raises:
-        RuntimeError: if vLLM's V2 model runner is enabled, attention layers
-            are selected while vLLM's prefix caching is enabled or its KV cache
-            is quantized, or MoE layers are selected and this rank writes but
-            its tensor-parallel rank 0 does not.
+        RuntimeError: if vLLM's V2 model runner or async scheduling is
+            enabled, attention layers are selected while vLLM's prefix
+            caching is enabled or its KV cache is quantized, or MoE layers
+            are selected and this rank writes but its tensor-parallel rank 0
+            does not.
         NotImplementedError: if speculative decoding is configured, or MoE
             layers are selected under context parallelism.
     """
@@ -53,6 +54,14 @@ class _Session:
                 "tensor_dump does not support vLLM's V2 model runner, whose "
                 "warmup runs real forwards that cannot be told apart from "
                 "requests; launch vLLM with VLLM_USE_V2_MODEL_RUNNER=0"
+            )
+        if settings.async_scheduling:
+            raise RuntimeError(
+                "tensor_dump does not support vLLM's async scheduling, which "
+                "schedules each forward before the previous step's sampled "
+                "tokens are processed, so a request that has stopped runs one "
+                "more forward and the dump records a step whose token is never "
+                "returned; start vLLM with --no-async-scheduling"
             )
         if settings.speculative:
             raise NotImplementedError(

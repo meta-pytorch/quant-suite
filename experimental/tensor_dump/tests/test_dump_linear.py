@@ -19,6 +19,7 @@ import torch
 from dump_test_utils import (
     dump_session,
     fake_metadata,
+    fake_vllm_config,
     FakeFlashInferMetadata,
     FakeForward,
     FakeForwardContext,
@@ -93,15 +94,6 @@ def _prefill(
 def _decode(forward: FakeForward, model: _Model, position: int = 3) -> torch.Tensor:
     forward.real({_ATTN: fake_metadata([1], [position])})
     return model(torch.randn(1, 4))
-
-
-def _vllm_config(use_v2_model_runner: bool) -> SimpleNamespace:
-    """The fields of vLLM's config that the dump reads."""
-    return SimpleNamespace(
-        use_v2_model_runner=use_v2_model_runner,
-        speculative_config=None,
-        cache_config=SimpleNamespace(enable_prefix_caching=False, cache_dtype="auto"),
-    )
 
 
 def _records(directory: Path, kind: str) -> list[dict[str, object]]:
@@ -215,7 +207,7 @@ class DumpLinearTest(unittest.TestCase):
         self.assertEqual(step["step"], 0)
 
     def test_context_parallel_is_read_from_the_config(self) -> None:
-        config = _vllm_config(use_v2_model_runner=False)
+        config = fake_vllm_config(use_v2_model_runner=False)
         self.assertFalse(_settings_from(config, None).context_parallel)
         for name in ("decode_context_parallel_size", "prefill_context_parallel_size"):
             config.parallel_config = SimpleNamespace(**{name: 2})
@@ -468,13 +460,13 @@ class DumpLinearTest(unittest.TestCase):
 
     def test_v2_model_runner_selected_by_config_raises(self) -> None:
         # The config selects the V2 runner although the variable is unset.
-        settings = _settings_from(_vllm_config(use_v2_model_runner=True), None)
+        settings = _settings_from(fake_vllm_config(use_v2_model_runner=True), None)
         with dump_session(self.directory, settings=settings):
             with self.assertRaisesRegex(RuntimeError, "VLLM_USE_V2_MODEL_RUNNER=0"):
                 _model()
 
     def test_v1_model_runner_selected_by_config_starts(self) -> None:
-        settings = _settings_from(_vllm_config(use_v2_model_runner=False), True)
+        settings = _settings_from(fake_vllm_config(use_v2_model_runner=False), True)
         self.assertFalse(settings.v2_model_runner)
         self.assertFalse(settings.prefix_caching)
         with dump_session(self.directory, settings=settings) as forward:
@@ -490,6 +482,26 @@ class DumpLinearTest(unittest.TestCase):
             _prefill(forward, model)
         self.assertEqual(len(_records(self.directory, "linear")), 1)
         self.assertTrue(_settings_from(None, True).v2_model_runner)
+
+    def test_async_scheduling_raises_at_startup(self) -> None:
+        settings = _VllmSettings(async_scheduling=True)
+        with dump_session(self.directory, settings=settings):
+            with self.assertRaisesRegex(RuntimeError, "--no-async-scheduling"):
+                _model()
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_async_scheduling_is_read_from_the_config(self) -> None:
+        for enabled in (True, False):
+            config = fake_vllm_config(async_scheduling=enabled)
+            self.assertEqual(_settings_from(config, None).async_scheduling, enabled)
+        self.assertIsNone(_settings_from(None, None).async_scheduling)
+
+    def test_async_scheduling_off_starts(self) -> None:
+        settings = _settings_from(fake_vllm_config(async_scheduling=False), None)
+        with dump_session(self.directory, settings=settings) as forward:
+            model = _model()
+            _prefill(forward, model)
+        self.assertEqual(len(_records(self.directory, "linear")), 1)
 
     def test_speculative_decoding_raises_at_startup(self) -> None:
         settings = _VllmSettings(speculative=True)

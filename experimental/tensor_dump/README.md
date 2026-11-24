@@ -436,6 +436,10 @@ alone. For each rank:
   nothing the dump options left out could have continued it). The reader's
   `Request.complete` is `starts_at_zero` only. Incomplete requests are
   merged like the others.
+- Every step of a request's phase must hold records of the same layers. A
+  step with records of only some layers, usually the last step of a dump
+  whose server was stopped during a forward or ran with async scheduling,
+  raises `ValueError` naming that step as incomplete; it is not dropped.
 - Each merged file is read back and compared bit for bit with the tensors it
   was made from before the manifest lists it; a difference raises
   `RuntimeError`.
@@ -582,7 +586,8 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
   --dtype bfloat16 \
   --max-model-len 4096 \
   --max-num-batched-tokens 4096 \
-  --no-enable-prefix-caching
+  --no-enable-prefix-caching \
+  --no-async-scheduling
 ```
 
 then send one request:
@@ -606,6 +611,14 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
 - The KV cache must be unquantized (`--kv-cache-dtype` `auto`, the default,
   `bfloat16` or `float16`) while attention layers are selected; the dump
   raises at startup otherwise.
+- `--no-async-scheduling` is required. vLLM schedules asynchronously by
+  default: it starts each forward before it has processed the tokens the
+  previous one sampled, so a request that has just stopped runs one more
+  forward, whose token is never returned, and a server stopped at that point
+  leaves a step with only some layers' records. The dump raises at startup if
+  vLLM's config has async scheduling on.
+- Stop the server only after its requests have finished, so that no forward
+  is cut short.
 - The default attention backend works: `FLASH_ATTN`, or `FLASHINFER` on GPUs
   of compute capability 10.x. On other GPUs, `FLASHINFER` runs prefills on a
   path the dump cannot read (see
@@ -648,7 +661,7 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
   requests share a step, `request` is only an index within that step and
   identifies no request across steps.
 - vLLM's V1 model runner only (`VLLM_USE_V2_MODEL_RUNNER=0`); the V2 model
-  runner raises at startup.
+  runner raises at startup, and so does async scheduling.
 - Speculative decoding raises at startup, and dual-batch overlap at the first
   step.
 - Every written tensor is copied to the host and saved synchronously, so
@@ -718,8 +731,8 @@ pytest experimental/tensor_dump/tests
   one step and a mixed step), the keys of a decode row as a slice, replay
   fields that change between steps, deleting the source, a failed
   verification deleting nothing unverified, re-verifying merged files before
-  a resumed merge deletes their source, resuming, an incomplete request, and
-  the command line and its thread cap.
+  a resumed merge deletes their source, resuming, an incomplete request, an
+  incomplete step, and the command line and its thread cap.
 - `test_runtime.py`: runtime resolution selects `RUNTIME` from its entry point,
   which builds the dump executors and still parses built-in presets.
 - `test_import_boundary.py`: the package imports only public QuantSuite

@@ -81,6 +81,8 @@ class _VllmSettings:
             configured; ``None`` when no vLLM config is current.
         kv_cache_dtype: vLLM's ``--kv-cache-dtype``; ``None`` when no vLLM
             config is current.
+        async_scheduling: Whether vLLM's async scheduling is enabled; ``None``
+            when no vLLM config is current.
     """
 
     v2_model_runner: bool = False
@@ -88,6 +90,7 @@ class _VllmSettings:
     prefix_caching: bool | None = None
     context_parallel: bool | None = None
     kv_cache_dtype: str | None = None
+    async_scheduling: bool | None = None
 
 
 def _forward_context() -> Any | None:
@@ -127,6 +130,7 @@ def _settings_from(config: Any | None, v2_env: bool | None) -> _VllmSettings:
             )
         ),
         kv_cache_dtype=str(config.cache_config.cache_dtype),
+        async_scheduling=bool(config.scheduler_config.async_scheduling),
     )
 
 

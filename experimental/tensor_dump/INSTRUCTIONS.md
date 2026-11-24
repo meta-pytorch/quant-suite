@@ -40,7 +40,8 @@ The [README](README.md) is the reference for every option and file format.
   cross-attention, chunked-local attention, ALiBi, attention sinks, and
   layers that share another layer's KV cache. A selected layer of one of
   these kinds raises; exclude it with the regular expression in step 4;
-- vLLM's V2 model runner, CUDA graphs and `torch.compile`, which all raise;
+- vLLM's V2 model runner, async scheduling, CUDA graphs and `torch.compile`,
+  which all raise;
 - speculative decoding (raises at startup) and dual-batch overlap (raises at
   the first step);
 - natively quantized weights, which raise when `weight` is selected.
@@ -187,6 +188,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
   --hf-overrides "{\"quantization_config_file\": \"$PWD/dump_recipe.yaml\"}" \
   --enforce-eager \
   --no-enable-prefix-caching \
+  --no-async-scheduling \
   --dtype bfloat16 \
   --max-model-len 8192 \
   --max-num-batched-tokens 8192 \
@@ -202,6 +204,7 @@ Required:
 | `--no-enable-prefix-caching` | Rebuilding a request's K and V needs every token to be computed in some step. Prefix caching skips cached prompt tokens, so the dump refuses to start while attention layers are selected. |
 | `--kv-cache-dtype auto` (the default), `bfloat16` or `float16` | Attention records hold unquantized keys and values. With a quantized KV cache, e.g. `fp8`, attention reads quantized ones, so the dump refuses to start while attention layers are selected. |
 | `VLLM_USE_V2_MODEL_RUNNER=0` | vLLM defaults to the V2 model runner, whose warmup runs real forwards that look like requests. The dump refuses to start under it. |
+| `--no-async-scheduling` | vLLM schedules asynchronously by default: each forward starts before the previous one's sampled tokens are processed, so a request that has just stopped runs one more forward, whose token is never returned. Stopping the server then leaves a step with only some layers' records, which the merge refuses. The dump refuses to start under async scheduling. |
 | `QUANT_SUITE_TENSOR_DUMP_DIR` | The output root. Unset or empty disables dumping, and the other variables are ignored. |
 
 Recommended:
@@ -213,6 +216,8 @@ Recommended:
   as its own prefill step, which is also fine.
 - Use a relative `--hf-overrides` path only if you start the server from the
   directory it is relative to.
+- Stop the server only after its requests have finished, so that no forward
+  is cut short.
 
 The attention hooks capture the same tensors under every attention backend,
 and the record's `backend` field says which one ran. The dump reads each
@@ -335,11 +340,9 @@ Tips for evaluation harnesses:
   different prompt than a full run does. Make the harness build the same
   prompt (for example, build examples `0..k` and send only `k`), and compare
   it with a full run's prompt before dumping.
-- **One extra decode step.** With vLLM's asynchronous scheduling, a request
-  that ends on a stop token can get one more decode step than one that ends
-  at `max_tokens`. That step is a real forward that feeds back the last
-  generated token, and its records are valid. Count decode steps from the
-  dump, or pass `--no-async-scheduling` to avoid the extra step.
+- **Decode steps.** A request that generated `completion_tokens` tokens,
+  whether it ended on a stop token or at `max_tokens`, has
+  `completion_tokens - 1` decode steps: its last token is never fed back.
 
 ## 8. Append runs
 
@@ -385,6 +388,9 @@ DST/rank_<R>/
   MoE layouts,
   and records per request `prompt_len`, `generated_len` and `complete`
   (its first step is in the dump, and no filter or budget cut it short).
+- **Incomplete steps:** every step of a request's phase must hold records of
+  the same layers. A step with records of only some layers raises
+  `ValueError` naming that step; the merge does not drop it.
 - **Verification:** each merged file is read back and compared bit for bit
   with the tensors it was made from before the manifest lists it. A difference
   raises `RuntimeError`.
@@ -483,6 +489,7 @@ print((out - a.output.float()).abs().max())
 | symptom | cause | fix |
 | --- | --- | --- |
 | `tensor_dump does not support vLLM's V2 model runner ...` at model load | vLLM uses the V2 runner by default | Set `VLLM_USE_V2_MODEL_RUNNER=0`. |
+| `tensor_dump does not support vLLM's async scheduling ...` at model load | vLLM schedules asynchronously by default | Add `--no-async-scheduling`. |
 | `QUANT_SUITE_TENSOR_DUMP_ATTENTION is set ... Start vLLM with --no-enable-prefix-caching` | Prefix caching is on while attention layers are selected | Add `--no-enable-prefix-caching`. |
 | `QUANT_SUITE_TENSOR_DUMP_ATTENTION is set, and vLLM's KV cache dtype is ...` | The KV cache is quantized, e.g. `--kv-cache-dtype fp8` | Use `--kv-cache-dtype auto`. |
 | `attention layer ... was called without a key tensor ...` at the first request | The model writes the KV cache itself and calls the attention layer without keys and values | Set `QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS=q,output`. |
@@ -503,6 +510,7 @@ print((out - a.output.float()).abs().max())
 | `tensor_dump cannot record attention layer ...` | The layer is a variant the record cannot describe (step 1) | Exclude it from `QUANT_SUITE_TENSOR_DUMP_ATTENTION`. |
 | `tensor_dump would overwrite ...` | A layer ran twice in one step (a module called twice per forward), or the directory holds files no manifest lists | Leave shared layers out of the selection, or use a new directory. |
 | `... in the weights an earlier run recorded ... runs a different model or recipe`, `... exists but no weight record lists it`, or `... holds a run in format ...` | Appending to a directory written by another model, recipe or format | Use a new directory. |
+| Merge raises `request N: step S is incomplete: ...` | The server was stopped while step `S` ran, or ran with async scheduling | Dump again with `--no-async-scheduling`, and stop the server only after its requests finish. |
 | `... does not end with a newline` or `line N of ... is not JSON` | An earlier run stopped while writing the manifest | Use a new directory for further runs. |
 | A multi-GPU run fails with an execute-model timeout on a written step | Written steps are slower than vLLM's timeout for tensor-parallel workers | Raise `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`. |
 | `import vllm` fails or loads the wrong code, or `vllm.__file__` points into your working directory | The current directory holds a `vllm/` directory that shadows the installed package | Run the server and scripts from another directory. |

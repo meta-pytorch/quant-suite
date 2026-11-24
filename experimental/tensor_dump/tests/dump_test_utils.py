@@ -439,6 +439,24 @@ def bind_fake_capture(module: FakeMoERunner, capturer: Any) -> None:
         module.router.set_capture_fn(capture_fn)
 
 
+def fake_vllm_config(
+    *,
+    use_v2_model_runner: bool = False,
+    enable_prefix_caching: bool = False,
+    cache_dtype: str = "auto",
+    async_scheduling: bool = False,
+) -> SimpleNamespace:
+    """The fields of vLLM's config that the dump reads."""
+    return SimpleNamespace(
+        use_v2_model_runner=use_v2_model_runner,
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=enable_prefix_caching, cache_dtype=cache_dtype
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+    )
+
+
 @contextmanager
 def dump_session(
     directory: Path | None,

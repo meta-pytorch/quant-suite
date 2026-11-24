@@ -125,6 +125,8 @@ _MANIFEST = "manifest.json"
 _STEP_REPLAY_FIELDS: frozenset[str] = frozenset(
     {"q_start_pos", "q_len", "kv_len", "kv_rows"}
 )
+# Missing layers an incomplete-step error names.
+_MISSING_SHOWN = 4
 
 
 def _sha256(tensor: torch.Tensor) -> str:
@@ -437,8 +439,8 @@ class _RankMerge:
         """The linear, attention and MoE layers with records at every slice.
 
         Raises:
-            ValueError: if the layers differ between slices, or a layer has
-                records of two kinds.
+            ValueError: if the layers differ between slices, for instance at
+                an incomplete step, or a layer has records of two kinds.
         """
 
         def common(kind: str, at: Callable[[RequestSlice], Iterable[str]]) -> list[str]:
@@ -446,10 +448,8 @@ class _RankMerge:
             for piece in slices[1:]:
                 names = sorted(at(piece))
                 if names != first:
-                    raise ValueError(
-                        f"request {request.id} has {kind} records of layers "
-                        f"{names} at step {piece.step} but {first} at step "
-                        f"{slices[0].step}"
+                    raise _layers_differ(
+                        request.id, kind, (slices[0].step, first), (piece.step, names)
                     )
             return first
 
@@ -950,6 +950,46 @@ def _checked_tensors(refs: Mapping[str, TensorRef]) -> dict[str, torch.Tensor]:
                 "entry records"
             )
     return tensors
+
+
+def _layers_differ(
+    request: int,
+    kind: str,
+    first: tuple[int, Sequence[str]],
+    other: tuple[int, Sequence[str]],
+) -> ValueError:
+    """The error for a request whose ``(step, layers)`` records of ``kind``
+    differ between two of its steps of one phase.
+
+    When one step's layers are a subset of the other's, that step is named as
+    incomplete.
+    """
+    (first_step, first_names), (other_step, other_names) = first, other
+    first_set, other_set = set(first_names), set(other_names)
+    if other_set < first_set:
+        step, recorded, reference, full = other_step, other_set, first_step, first_set
+    elif first_set < other_set:
+        step, recorded, reference, full = first_step, first_set, other_step, other_set
+    else:
+        return ValueError(
+            f"request {request} has {kind} records of layers {sorted(other_names)} "
+            f"at step {other_step} but {sorted(first_names)} at step {first_step}"
+        )
+    missing = sorted(full - recorded)
+    shown = ", ".join(missing[:_MISSING_SHOWN])
+    if len(missing) > _MISSING_SHOWN:
+        shown += f", and {len(missing) - _MISSING_SHOWN} more"
+    return ValueError(
+        f"request {request}: step {step} is incomplete: it holds {kind} records "
+        f"of {len(recorded)} of the {len(full)} layers recorded at step "
+        f"{reference} (missing {shown}). An incomplete step, usually the last "
+        "one of a dump, comes from a forward that was cut short: the server "
+        "was stopped while the forward ran, or it ran with async scheduling, "
+        "which starts one more forward for a request that has already "
+        "stopped. Dump with vLLM started with --no-async-scheduling, and stop "
+        "the server only after its requests finish (see 'Run with vLLM' in "
+        "the tensor_dump README)"
+    )
 
 
 def _prefill_before_decode(slices: Sequence[RequestSlice]) -> bool:
