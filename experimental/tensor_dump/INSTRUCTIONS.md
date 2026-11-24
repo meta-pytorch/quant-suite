@@ -158,7 +158,8 @@ Required:
 | `--quantization quant_suite` with the recipe in `--hf-overrides` | Linear layers are recorded by QuantSuite's linear executor, and building it starts the dump session. Without it nothing is written. |
 | `--enforce-eager` | The dump code must run in Python at every forward. Under CUDA graphs or `torch.compile` the dump raises. |
 | `--no-enable-prefix-caching` | Rebuilding a request's K and V needs every token to be computed in some step. Prefix caching skips cached prompt tokens, so the dump refuses to start while attention layers are selected. |
-| `VLLM_USE_V2_MODEL_RUNNER=0` | vLLM 0.30 defaults to the V2 model runner, whose warmup runs real forwards that look like requests. The dump refuses to start under it. |
+| `--kv-cache-dtype auto` (the default), `bfloat16` or `float16` | Attention records hold unquantized keys and values. With a quantized KV cache, e.g. `fp8`, attention reads quantized ones, so the dump refuses to start while attention layers are selected. |
+| `VLLM_USE_V2_MODEL_RUNNER=0` | vLLM defaults to the V2 model runner, whose warmup runs real forwards that look like requests. The dump refuses to start under it. |
 | `QUANT_SUITE_TENSOR_DUMP_DIR` | The output root. Unset or empty disables dumping, and the other variables are ignored. |
 
 Recommended:
@@ -424,8 +425,10 @@ print((out - a.output.float()).abs().max())
 
 | symptom | cause | fix |
 | --- | --- | --- |
-| `tensor_dump does not support vLLM's V2 model runner ...` at model load | vLLM 0.30 uses the V2 runner by default | Set `VLLM_USE_V2_MODEL_RUNNER=0`. |
+| `tensor_dump does not support vLLM's V2 model runner ...` at model load | vLLM uses the V2 runner by default | Set `VLLM_USE_V2_MODEL_RUNNER=0`. |
 | `QUANT_SUITE_TENSOR_DUMP_ATTENTION is set ... Start vLLM with --no-enable-prefix-caching` | Prefix caching is on while attention layers are selected | Add `--no-enable-prefix-caching`. |
+| `QUANT_SUITE_TENSOR_DUMP_ATTENTION is set, and vLLM's KV cache dtype is ...` | The KV cache is quantized, e.g. `--kv-cache-dtype fp8` | Use `--kv-cache-dtype auto`. |
+| `attention layer ... was called without a key tensor ...` at the first request | The model writes the KV cache itself and calls the attention layer without keys and values | Set `QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS=q,output`. |
 | `tensor_dump requires eager execution ...` at the first request | CUDA graphs or `torch.compile` are on | Add `--enforce-eager`. |
 | `tensor_dump needs query_start_loc and seq_lens, or FlashInfer's decode and prefill fields, ...` at the first request | The attention backend's metadata describes no requests in a form the dump reads | Add `--attention-backend FLASH_ATTN`. |
 | `tensor_dump cannot read the prefill requests of FlashInferMetadata: FlashInfer runs them through FIPrefill ...` | FLASHINFER runs prefills through its native wrapper: on a GPU below compute capability 10.0, with decode context parallelism, or with `--attention-config.use_trtllm_attention=0` | On compute capability 10.x, add `--attention-config.use_trtllm_attention=1`; elsewhere add `--attention-backend FLASH_ATTN`. |

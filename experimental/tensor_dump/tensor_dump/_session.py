@@ -25,6 +25,9 @@ from tensor_dump._writer import _Writer
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# KV-cache dtypes that store keys and values unquantized.
+_UNQUANTIZED_KV_CACHE_DTYPES = frozenset({"auto", "bfloat16", "float16"})
+
 
 class _Session:
     """The options, step tracker, writer, name resolver and attention hooks of
@@ -32,7 +35,8 @@ class _Session:
 
     Raises:
         RuntimeError: if vLLM's V2 model runner is enabled, or attention layers
-            are selected while vLLM's prefix caching is enabled.
+            are selected while vLLM's prefix caching is enabled or its KV cache
+            is quantized.
         NotImplementedError: if speculative decoding is configured.
     """
 
@@ -55,6 +59,19 @@ class _Session:
                 "values of each step's new tokens, so every token must be "
                 "computed; vLLM's prefix caching skips cached prompt tokens. "
                 "Start vLLM with --no-enable-prefix-caching"
+            )
+        kv_cache_dtype = settings.kv_cache_dtype
+        if (
+            pattern is not None
+            and kv_cache_dtype is not None
+            and kv_cache_dtype not in _UNQUANTIZED_KV_CACHE_DTYPES
+        ):
+            raise RuntimeError(
+                f"{_ATTENTION_ENV} is set, and vLLM's KV cache dtype is "
+                f"{kv_cache_dtype!r}: attention then reads quantized keys and "
+                "values and may get a quantized query, so the recorded tensors "
+                "would not reproduce its output. Start vLLM with "
+                "--kv-cache-dtype auto"
             )
         self.options = options
         self.settings = settings

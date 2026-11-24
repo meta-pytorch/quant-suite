@@ -359,10 +359,57 @@ class DumpAttentionTest(unittest.TestCase):
             config = SimpleNamespace(
                 use_v2_model_runner=False,
                 speculative_config=None,
-                cache_config=SimpleNamespace(enable_prefix_caching=enabled),
+                cache_config=SimpleNamespace(
+                    enable_prefix_caching=enabled, cache_dtype="auto"
+                ),
             )
             self.assertEqual(_settings_from(config, None).prefix_caching, enabled)
         self.assertIsNone(_settings_from(None, None).prefix_caching)
+
+    def test_quantized_kv_cache_raises_when_attention_is_selected(self) -> None:
+        for dtype in ("fp8", "fp8_e4m3"):
+            with self.subTest(dtype=dtype):
+                settings = _VllmSettings(kv_cache_dtype=dtype)
+                with dump_session(self.directory, settings=settings, ATTENTION=".*"):
+                    with self.assertRaisesRegex(RuntimeError, "--kv-cache-dtype auto"):
+                        _Model()
+        with dump_session(
+            self.directory, settings=_VllmSettings(kv_cache_dtype="fp8")
+        ) as forward:
+            _run(forward, _Model(), [2], [0])
+        self.assertEqual(list(self.directory.iterdir()), [])
+        for dtype in ("auto", "bfloat16", "float16"):
+            with self.subTest(dtype=dtype):
+                directory = Path(tempfile.mkdtemp())
+                with dump_session(
+                    directory,
+                    settings=_VllmSettings(kv_cache_dtype=dtype),
+                    ATTENTION=".*",
+                ) as forward:
+                    _run(forward, _Model(), [2], [0])
+                self.assertEqual(len(_records(directory)), len(_LAYERS))
+
+    def test_kv_cache_dtype_is_read_from_the_config(self) -> None:
+        config = SimpleNamespace(
+            use_v2_model_runner=False,
+            speculative_config=None,
+            cache_config=SimpleNamespace(
+                enable_prefix_caching=False, cache_dtype="fp8_e4m3"
+            ),
+        )
+        self.assertEqual(_settings_from(config, None).kv_cache_dtype, "fp8_e4m3")
+        self.assertIsNone(_settings_from(None, None).kv_cache_dtype)
+
+    def test_missing_key_raises(self) -> None:
+        with dump_session(self.directory, ATTENTION=_LAYERS[0]) as forward:
+            model = _Model()
+            forward.real({name: generic_metadata([2], [0]) for name in _LAYERS})
+            q, _, _ = _inputs(2)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "without a key tensor.*QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS",
+            ):
+                model.layers[0](q, None, None)
 
 
 if __name__ == "__main__":

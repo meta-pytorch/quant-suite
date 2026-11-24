@@ -39,8 +39,9 @@ built-in ones compute. The attention hooks only read.
 - Q and K are what the model passes to the attention layer: after any rotary
   embedding, QK norm and query pre-scale. The output is the attention layer's,
   before anything the model applies after it, such as an output gate.
-- Q, K and V are taken before any quantization inside the attention backend,
-  such as an FP8 KV cache; `kv_cache_dtype` in the record says which.
+- Q, K and V are taken before any quantization inside the attention backend;
+  attention is recorded only with an unquantized KV cache (`auto`,
+  `bfloat16` or `float16`).
 - Each tensor is the shard of the rank that writes it. A row-parallel linear
   layer's output is the partial sum before the all-reduce.
 
@@ -462,6 +463,9 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
   selected: rebuilding a request's keys and values needs every token's to have
   been computed, and prefix caching skips cached prompt tokens. The dump
   raises at startup if vLLM's config has prefix caching on.
+- The KV cache must be unquantized (`--kv-cache-dtype` `auto`, the default,
+  `bfloat16` or `float16`) while attention layers are selected; the dump
+  raises at startup otherwise.
 - The default attention backend works: `FLASH_ATTN`, or `FLASHINFER` on GPUs
   of compute capability 10.x. On other GPUs, `FLASHINFER` runs prefills on a
   path the dump cannot read (see
@@ -490,6 +494,8 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
 - Under `FLASHINFER`, a step whose prefills or decodes run on FlashInfer's
   native wrappers raises `RuntimeError` (see
   [Environment variables](#environment-variables)).
+- A model that writes the KV cache itself and calls the attention layer
+  without keys and values raises `RuntimeError` when `k` or `v` is selected.
 - Weights are recorded as registered: unquantized or fake-quantized. Natively
   quantized weights raise `NotImplementedError`.
 - Step ids agree across tensor- and pipeline-parallel ranks, not across
@@ -536,7 +542,8 @@ pytest experimental/tensor_dump/tests
   unset), unchanged outputs, several requests in one step, a chunked prefill
   then a decode holding only new rows, FlashInfer metadata mapped to rows,
   layer and tensor selection, dummy forwards (without attention metadata or
-  without KV-cache slots), unsupported layers, and the prefix-caching check.
+  without KV-cache slots), unsupported layers, a missing key, and the
+  prefix-caching and KV-cache dtype checks.
 - `test_dump_attention_gpu.py` (GPU and vLLM): two requests through vLLM's
   FlashAttention kernel over a chunked prefill and decodes, with and without a
   sliding window, once inside vLLM's own forward context; the outputs are

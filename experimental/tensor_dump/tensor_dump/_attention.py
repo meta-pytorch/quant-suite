@@ -22,7 +22,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-from tensor_dump._options import _ATTENTION_ENV
+from tensor_dump._options import _ATTENTION_ENV, _ATTENTION_TENSORS_ENV
 from tensor_dump._step import _StepTracker
 from tensor_dump._writer import _AttentionLayout, _check_layer_name, _Writer
 from torch.utils.hooks import RemovableHandle
@@ -196,7 +196,8 @@ class _AttentionDump:
             if not isinstance(tensor, torch.Tensor):
                 raise RuntimeError(
                     f"attention layer {layout.layer!r} was called without a "
-                    f"{argument} tensor"
+                    f"{argument} tensor, as a model that writes the KV cache "
+                    f"itself does. Remove k and v from {_ATTENTION_TENSORS_ENV}"
                 )
             tensors[name] = tensor.reshape(-1, heads, size)
         self._writer.attention(step, layout, requests, tensors, query.dtype)

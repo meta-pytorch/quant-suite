@@ -100,7 +100,7 @@ def _vllm_config(use_v2_model_runner: bool) -> SimpleNamespace:
     return SimpleNamespace(
         use_v2_model_runner=use_v2_model_runner,
         speculative_config=None,
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        cache_config=SimpleNamespace(enable_prefix_caching=False, cache_dtype="auto"),
     )
 
 
