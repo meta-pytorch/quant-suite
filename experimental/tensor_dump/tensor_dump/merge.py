@@ -10,8 +10,12 @@
 
     rank_<R>/manifest.json
     rank_<R>/weights/<layer>.pt               {"weight": W, "bias": b}
+    rank_<R>/moe_layouts/<layer>.pt           {"e_score_correction_bias": b}
     rank_<R>/req_<NNNN>/<phase>/<layer>.pt    linear: {"input", "output"}
                                               attention: {"q", "k", "v", "output"}
+                                              moe: {"input", "router_logits",
+                                                    "topk_ids", "topk_weights",
+                                                    "gemm2", "output"}
 
 Each ``.pt`` file holds a dict of tensors saved with ``torch.save``; a dict
 holds only the tensors the dump wrote. ``<NNNN>`` is the request's index among
@@ -23,7 +27,9 @@ request has in that step, so the requests of a ``mixed`` step are split too.
 Every tensor stacks the request's rows of the phase along dim 0, in step
 order, which is position order: linear ``input`` ``[T, in]`` and ``output``
 ``[T, out]``; attention ``q`` and ``output`` ``[T, num_q_heads, head_size]``,
-``k`` and ``v`` ``[T, num_kv_heads, head_size]``. Prefill rows are the prompt
+``k`` and ``v`` ``[T, num_kv_heads, head_size]``; MoE ``input`` and ``output``
+``[T, hidden_size]``, ``router_logits`` ``[T, num_experts]``, ``topk_ids`` and
+``topk_weights`` ``[T, top_k]``, ``gemm2`` ``[T, top_k, hidden_size]``. Prefill rows are the prompt
 rows of every chunk; decode rows are one per decode step. As the dump writes
 only the new rows of K and V, a request whose prefill rows all come before its
 decode rows has the full keys of its ``i``-th decode row in
@@ -36,6 +42,9 @@ decode rows has the full keys of its ``i``-th decode row in
   with the ``run`` that wrote it;
 - ``weights``: per layer, the ``file``, its ``bytes``, the ``step`` the dump
   wrote it at, and ``tensors``: ``shape``, ``dtype`` and ``sha256`` of each;
+- ``moe_layouts``: per MoE layer, the layout record's ``fields``, the ``step``
+  the dump wrote it at, and, as for weights, ``file`` (``null`` when the layer
+  has no tensors to keep), ``bytes`` and ``tensors``;
 - ``requests``: per request, ``request``, ``run``, ``steps``,
   ``prompt_len``, ``generated_len``, ``starts_at_zero`` (its first step is
   in the dump; this is ``tensor_dump.reader.Request.complete``),
@@ -54,20 +63,22 @@ decode rows has the full keys of its ``i``-th decode row in
     index in the step's batch), ``token_start`` (its first row in the step's
     linear tensors), ``q_start_pos`` and ``kv_len``. Row
     ``row_start + j`` has position ``q_start_pos + j``;
-  - ``layers``: per layer, ``kind`` (``linear`` or ``attention``), ``file``,
+  - ``layers``: per layer, ``kind`` (``linear``, ``attention`` or ``moe``), ``file``,
     ``bytes`` and ``tensors`` (``shape`` and ``dtype`` of each), and for
     attention the dump's ``replay`` fields other than ``q_start_pos``,
     ``q_len``, ``kv_len`` and ``kv_rows``, which the segments give. They are
     the same at every step of a layer; if not, ``replay_ranges`` lists them per
     half-open range of ``rows`` instead of ``replay``.
+    For MoE, the records' ``replicated_on`` and ``replicated_tensors``, which
+    must be the same at every step of the request.
 
 - ``source_deleted``: whether the dump's manifest has been deleted.
 
 Every merged file is read back and compared bit for bit with the dump's
 tensors it came from before the manifest lists it. With ``delete_source``, a
 dump file is deleted only once every file merged from it is verified: a step
-directory once every request with rows in it is, a weight once its merged copy
-is, and the dump's manifest last, once nothing else is left. A merge that
+directory once every request with rows in it is, a weight or MoE layout once
+its merged copy is, and the dump's manifest last, once nothing else is left. A merge that
 stops part way can be run again: requests and weights the destination
 manifest lists are checked against the dump and skipped. With
 ``delete_source``, the merged files of those requests and weights are read
@@ -96,6 +107,7 @@ from tensor_dump.reader import (
     _dtype_name,
     _rank_dirs,
     LinearPair,
+    MoELayout,
     Request,
     RequestSlice,
     TensorDump,
@@ -288,7 +300,17 @@ class _RankMerge:
         self._attention: dict[tuple[int, int], dict[str, Mapping[str, TensorRef]]] = {}
         for layer, step, request, tensors in dump._attention_records(rank):
             self._attention.setdefault((step, request), {})[layer] = tensors
+        self._moe: dict[int, dict[str, Mapping[str, TensorRef]]] = {}
+        self._moe_record_fields: dict[
+            tuple[str, int], tuple[int | None, tuple[str, ...]]
+        ] = {}
+        for layer, step, refs in dump._moe_records(rank):
+            self._moe.setdefault(step, {})[layer] = refs
+            self._moe_record_fields[(layer, step)] = dump._moe_fields.get(
+                (rank, layer, step), (None, ())
+            )
         self._weights: dict[str, Mapping[str, TensorRef]] = dump._weight_refs(rank)
+        self._layouts: dict[str, MoELayout] = dump._moe_layouts_of(rank)
         self._step_files = self._files_by_step()
         self._step_requests: dict[int, set[int]] = {}
         for request in self._requests:
@@ -300,11 +322,13 @@ class _RankMerge:
         # Requests whose merged files this pass wrote or read back.
         self._verified: set[int] = set()
         self._weights_done: dict[str, dict[str, Any]] = {}
+        self._layouts_done: dict[str, dict[str, Any]] = {}
         self._source_deleted = False
         self._read_destination()
 
     def run(self) -> None:
         self._merge_weights()
+        self._merge_layouts()
         if self._delete_source:
             self._delete_steps(sorted(self._steps.keys() | self._step_files.keys()))
         for request in self._requests:
@@ -336,6 +360,9 @@ class _RankMerge:
         for (step, _), layers in self._attention.items():
             for refs in layers.values():
                 files.setdefault(step, []).extend(ref.path for ref in refs.values())
+        for step, layers in self._moe.items():
+            for refs in layers.values():
+                files.setdefault(step, []).extend(ref.path for ref in refs.values())
         return files
 
     def _steps_to_keep(self) -> set[int]:
@@ -354,7 +381,8 @@ class _RankMerge:
                 if start != end:
                     break
                 end += count
-            if self._linear.get(step) and end != written.num_actual_tokens:
+            has_rows = self._linear.get(step) or self._moe.get(step)
+            if has_rows and end != written.num_actual_tokens:
                 kept.add(step)
         batch = {
             (step, piece.request)
@@ -405,11 +433,12 @@ class _RankMerge:
 
     def _layers(
         self, request: Request, slices: Sequence[RequestSlice]
-    ) -> tuple[list[str], list[str]]:
-        """The linear and attention layers with records at every slice.
+    ) -> tuple[list[str], list[str], list[str]]:
+        """The linear, attention and MoE layers with records at every slice.
 
         Raises:
-            ValueError: if the layers differ between slices.
+            ValueError: if the layers differ between slices, or a layer has
+                records of two kinds.
         """
 
         def common(kind: str, at: Callable[[RequestSlice], Iterable[str]]) -> list[str]:
@@ -429,10 +458,16 @@ class _RankMerge:
             "attention",
             lambda piece: self._attention.get((piece.step, piece.request), {}),
         )
-        both = set(linear) & set(attention)
-        if both:
-            raise ValueError(f"layers {sorted(both)} have linear and attention records")
-        return linear, attention
+        moe = common("moe", lambda piece: self._moe.get(piece.step, {}))
+        kinds = (("linear", linear), ("attention", attention), ("moe", moe))
+        for index, (kind, names) in enumerate(kinds):
+            for other, other_names in kinds[index + 1 :]:
+                both = set(names) & set(other_names)
+                if both:
+                    raise ValueError(
+                        f"layers {sorted(both)} have {kind} and {other} records"
+                    )
+        return linear, attention, moe
 
     def _may_continue(self, request: Request) -> bool:
         """Whether the dump may have stopped writing before the request's
@@ -498,12 +533,24 @@ class _RankMerge:
                     "new destination"
                 )
             self._weights_done[layer] = entry
+        for layer, entry in manifest.get("moe_layouts", {}).items():
+            layout = self._layouts.get(layer)
+            if (
+                layout is None
+                or dict(layout.fields) != entry["fields"]
+                or self._weight_tensors(_layout_refs(layout)) != entry["tensors"]
+            ):
+                raise RuntimeError(
+                    f"MoE layout {layer!r} of {path} does not match the dump; use "
+                    "a new destination"
+                )
+            self._layouts_done[layer] = entry
 
     def _plan(self, request: Request) -> dict[str, Any]:
         plan: dict[str, Any] = {}
         for phase, slices in self._phase_slices(request).items():
-            linear, attention = self._layers(request, slices)
-            plan[phase] = (self._segments(slices), sorted(linear + attention))
+            linear, attention, moe = self._layers(request, slices)
+            plan[phase] = (self._segments(slices), sorted(linear + attention + moe))
         return plan
 
     @staticmethod
@@ -548,6 +595,7 @@ class _RankMerge:
                 for step in self._steps.values()
             ],
             "weights": self._weights_done,
+            "moe_layouts": self._layouts_done,
             "requests": [self._done[index] for index in sorted(self._done)],
             "source_deleted": self._source_deleted,
         }
@@ -566,14 +614,7 @@ class _RankMerge:
                 self._remove([ref.path for ref in refs.values()], levels=1)
 
     def _merge_weight(self, layer: str, refs: Mapping[str, TensorRef]) -> None:
-        tensors = {name: ref.load() for name, ref in refs.items()}
-        for name, tensor in tensors.items():
-            recorded = refs[name].sha256
-            if recorded is not None and _sha256(tensor) != recorded:
-                raise RuntimeError(
-                    f"{refs[name].path} does not match the SHA-256 its manifest "
-                    "entry records"
-                )
+        tensors = _checked_tensors(refs)
         relative = f"weights/{layer}.pt"
         path = self._destination / relative
         _save(path, tensors)
@@ -589,20 +630,58 @@ class _RankMerge:
     def _reverify_weight(self, layer: str, refs: Mapping[str, TensorRef]) -> None:
         """Compare an earlier pass's merged weight with the dump's files
         still there, bit for bit."""
+        self._reverify_file(self._weights_done[layer], refs)
+
+    def _reverify_file(
+        self, entry: Mapping[str, Any], refs: Mapping[str, TensorRef]
+    ) -> None:
         parts = {name: [_load_ref(ref, missing_ok=True)] for name, ref in refs.items()}
         if _has_data(parts):
-            _verify(self._destination / str(self._weights_done[layer]["file"]), parts)
+            _verify(self._destination / str(entry["file"]), parts)
+
+    def _merge_layouts(self) -> None:
+        for layer, layout in sorted(self._layouts.items()):
+            refs = _layout_refs(layout)
+            if layer not in self._layouts_done:
+                self._merge_layout(layer, layout, refs)
+            elif self._delete_source:
+                self._reverify_file(self._layouts_done[layer], refs)
+            if self._delete_source:
+                self._remove([ref.path for ref in refs.values()], levels=1)
+
+    def _merge_layout(
+        self, layer: str, layout: MoELayout, refs: Mapping[str, TensorRef]
+    ) -> None:
+        relative: str | None = None
+        size: int | None = None
+        if refs:
+            tensors = _checked_tensors(refs)
+            relative = f"moe_layouts/{layer}.pt"
+            path = self._destination / relative
+            _save(path, tensors)
+            _verify(path, {name: [tensor] for name, tensor in tensors.items()})
+            size = path.stat().st_size
+        self._layouts_done[layer] = {
+            "file": relative,
+            "bytes": size,
+            "step": layout.step,
+            "fields": dict(layout.fields),
+            "tensors": self._weight_tensors(refs),
+        }
+        self._write_manifest()
 
     def _reverify_request(self, request: Request) -> None:
         """Compare the merged files of a request an earlier pass merged with
         the dump's files still there, bit for bit."""
         phases = self._done[request.id]["phases"]
         for phase, slices in self._phase_slices(request).items():
-            linear, attention = self._layers(request, slices)
+            linear, attention, moe = self._layers(request, slices)
             layers = phases[phase]["layers"]
-            for layer in linear + attention:
+            for layer in linear + attention + moe:
                 if layer in attention:
                     parts = self._attention_parts(layer, slices, missing_ok=True)
+                elif layer in moe:
+                    parts = self._moe_parts(layer, slices, missing_ok=True)
                 else:
                     parts = self._linear_parts(layer, slices, missing_ok=True)
                 if _has_data(parts):
@@ -631,13 +710,17 @@ class _RankMerge:
     def _merge_phase(
         self, request: Request, phase: str, slices: Sequence[RequestSlice]
     ) -> dict[str, Any]:
-        linear, attention = self._layers(request, slices)
+        linear, attention, moe = self._layers(request, slices)
         directory = f"req_{request.id:04d}/{phase}"
         layers: dict[str, dict[str, object]] = {}
         for layer in linear:
             layers[layer] = self._merge_linear(directory, layer, slices)
         for layer in attention:
             layers[layer] = self._merge_attention(directory, layer, slices)
+        for layer in moe:
+            parts = self._moe_parts(layer, slices, missing_ok=False)
+            extra = self._moe_fields(layer, slices)
+            layers[layer] = self._write(directory, layer, "moe", parts, extra)
         return {
             "rows": sum(piece.q_len for piece in slices),
             "segments": self._segments(slices),
@@ -653,12 +736,54 @@ class _RankMerge:
     def _linear_parts(
         self, layer: str, slices: Sequence[RequestSlice], *, missing_ok: bool
     ) -> dict[str, list[torch.Tensor]]:
-        """The request's rows of each of ``layer``'s tensors, per slice."""
+        """The request's rows of each of linear ``layer``'s tensors, per slice."""
+
+        def refs(step: int) -> dict[str, TensorRef]:
+            pair = self._linear[step][layer]
+            refs = {"input": pair.activation, "output": pair.output}
+            return {name: ref for name, ref in refs.items() if ref is not None}
+
+        return self._row_parts(layer, slices, refs, missing_ok=missing_ok)
+
+    def _moe_parts(
+        self, layer: str, slices: Sequence[RequestSlice], *, missing_ok: bool
+    ) -> dict[str, list[torch.Tensor]]:
+        """The request's rows of each of MoE ``layer``'s tensors, per slice."""
+        return self._row_parts(
+            layer, slices, lambda step: self._moe[step][layer], missing_ok=missing_ok
+        )
+
+    def _moe_fields(
+        self, layer: str, slices: Sequence[RequestSlice]
+    ) -> dict[str, object]:
+        """The ``replicated_on`` and ``replicated_tensors`` of ``layer``'s
+        records at the slices' steps.
+
+        Raises:
+            ValueError: if they differ between steps.
+        """
+        fields = {self._moe_record_fields[(layer, piece.step)] for piece in slices}
+        if len(fields) != 1:
+            raise ValueError(
+                f"MoE layer {layer!r} has records with different replicated "
+                f"tensors at the steps of one request: {sorted(fields, key=str)}"
+            )
+        replicated_on, replicated = fields.pop()
+        return {"replicated_on": replicated_on, "replicated_tensors": list(replicated)}
+
+    def _row_parts(
+        self,
+        layer: str,
+        slices: Sequence[RequestSlice],
+        refs_at: Callable[[int], Mapping[str, TensorRef]],
+        *,
+        missing_ok: bool,
+    ) -> dict[str, list[torch.Tensor]]:
+        """The request's rows of tensors that hold one row per token of a
+        step, per slice."""
         parts: dict[str, list[torch.Tensor]] = {}
         for piece in slices:
-            pair = self._linear[piece.step][layer]
-            refs = {"input": pair.activation, "output": pair.output}
-            tensors = {name: ref for name, ref in refs.items() if ref is not None}
+            tensors = refs_at(piece.step)
             _check_names(layer, piece.step, tensors, parts)
             rows = slice(piece.token_start, piece.token_start + piece.q_len)
             for name, ref in tensors.items():
@@ -776,12 +901,15 @@ class _RankMerge:
             return
         if self._weights.keys() - self._weights_done.keys():
             return
+        if self._layouts.keys() - self._layouts_done.keys():
+            return
         if (self._steps.keys() | self._step_files.keys()) - self._deleted:
             return
         (self._source / _SOURCE_MANIFEST).unlink()
         self._source_deleted = True
         self._write_manifest()
         _remove_empty(self._source / "weights", warn=False)
+        _remove_empty(self._source / "moe_layouts", warn=False)
         _remove_empty(self._source, warn=True)
         logger.info("rank %d: deleted the merged source %s", self._rank, self._source)
 
@@ -800,6 +928,28 @@ def _option_int(options: Mapping[str, object], key: str) -> int:
             f"a run record has {key}={value!r}; expected a non-negative integer"
         )
     return value
+
+
+def _layout_refs(layout: MoELayout) -> dict[str, TensorRef]:
+    bias = layout.e_score_correction_bias
+    return {} if bias is None else {"e_score_correction_bias": bias}
+
+
+def _checked_tensors(refs: Mapping[str, TensorRef]) -> dict[str, torch.Tensor]:
+    """The tensors of ``refs``, each checked against its recorded SHA-256.
+
+    Raises:
+        RuntimeError: if a tensor does not match its SHA-256.
+    """
+    tensors = {name: ref.load() for name, ref in refs.items()}
+    for name, tensor in tensors.items():
+        recorded = refs[name].sha256
+        if recorded is not None and _sha256(tensor) != recorded:
+            raise RuntimeError(
+                f"{refs[name].path} does not match the SHA-256 its manifest "
+                "entry records"
+            )
+    return tensors
 
 
 def _prefill_before_decode(slices: Sequence[RequestSlice]) -> bool:

@@ -404,7 +404,7 @@ class ReaderTest(unittest.TestCase):
             self._open(directory).requests()
 
     def test_unsupported_format_raises(self) -> None:
-        self.assertEqual(_FORMAT_VERSIONS, frozenset({_FORMAT_VERSION}))
+        self.assertIn(_FORMAT_VERSION, _FORMAT_VERSIONS)
         manifest = self.directory / "rank_0" / "manifest.jsonl"
         lines = manifest.read_text().splitlines()
         run = json.loads(lines[0])

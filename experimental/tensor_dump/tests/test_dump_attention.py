@@ -108,7 +108,7 @@ class DumpAttentionTest(unittest.TestCase):
             model = _Model()
             (q, k, v), outputs = _run(forward, model, [5], [0])
         manifest = read_manifest(self.directory)
-        self.assertEqual(manifest[0]["format_version"], 2)
+        self.assertEqual(manifest[0]["format_version"], 3)
         self.assertEqual(manifest[0]["options"]["attention"], ".*")
         self.assertEqual([r for r in manifest if r["record"] == "linear"], [])
         expected = {

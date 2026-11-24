@@ -363,7 +363,7 @@ class MergeTest(unittest.TestCase):
         merge(self.source, self.destination)
         manifest = _manifest(self.destination)
         self.assertEqual(manifest["merged_format_version"], 1)
-        self.assertEqual(manifest["source_format_versions"], [2])
+        self.assertEqual(manifest["source_format_versions"], [3])
         self.assertEqual([run["run"] for run in manifest["runs"]], [0, 1])
         self.assertEqual([step["step"] for step in manifest["steps"]], list(range(10)))
         self.assertEqual(manifest["steps"][8]["phase"], "mixed")

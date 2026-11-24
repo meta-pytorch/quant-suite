@@ -6,8 +6,9 @@
 For a step-by-step guide to collecting dumps, see [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
 
 `tensor_dump` (distribution `quant_suite_tensor_dump`) records the operands and
-results of a QuantSuite model's linear layers, and the inputs and output of its
-attention layers, while vLLM runs it, so they can be analysed offline. The
+results of a QuantSuite model's linear layers, the inputs and output of its
+attention layers, and the routing and expert outputs of its MoE layers, while
+vLLM runs it, so they can be analysed offline. The
 attention records hold everything needed to recompute the attention output,
 so the recorded Q, K and V can be replayed through other attention
 implementations and their outputs compared against the recorded one.
@@ -17,7 +18,9 @@ only: a tensor recipe type, `dump`, and the linear executor of the package's
 recipe runtime. Attention layers are recorded by forward hooks on vLLM's
 `Attention` layer, which capture the same tensors under every attention
 backend; recording needs a backend whose metadata describes the step's
-requests (see [Environment variables](#environment-variables)).
+requests (see [Environment variables](#environment-variables)). MoE layers are
+recorded by forward hooks on vLLM's `MoERunner` layer and by the outputs its
+experts kernel hands over (see [MoE layers](#moe-layers)).
 
 ## What is recorded
 
@@ -25,10 +28,11 @@ requests (see [Environment variables](#environment-variables)).
 | --- | --- | --- |
 | linear | `input`, `weight`, `output` | the executor's `forward`: the raw activation, the registered weight (and bias), and the layer output including the bias |
 | attention | `q`, `k`, `v`, `output` | a forward hook on vLLM's `Attention` layer: its `query`, `key` and `value` arguments, and the output it returns |
+| MoE | `input`, `router_logits`, `topk_ids`, `topk_weights`, `gemm2`, `output` | a forward hook on vLLM's `MoERunner` layer for its `hidden_states` and `router_logits` arguments and its output; the experts kernel's own routing and GEMM2 outputs for the rest |
 
 A recipe that only marks layers for dumping changes no value: the `dump` stage
 returns its input unchanged and the executors compute exactly what the
-built-in ones compute. The attention hooks only read.
+built-in ones compute. The attention and MoE hooks only read.
 
 - Linear rows cover the tokens of the step.
 - Attention is recorded per request, unpadded. K and V have one head per KV
@@ -97,6 +101,8 @@ only.
 | `QUANT_SUITE_TENSOR_DUMP_MAX_BYTES` | unset | Byte budget of each rank's directory: an integer with an optional suffix `K`, `M`, `G` or `T` (case-insensitive, powers of 1000, so `500G` is 500 * 10^9 bytes). Unset or `0` means no budget. See [Byte budget](#byte-budget). |
 | `QUANT_SUITE_TENSOR_DUMP_ATTENTION` | unset | Regular expression over vLLM's attention layer names (`Attention.layer_name`, e.g. `model.layers.0.self_attn.attn`), matched with `re.match` like recipe patterns. Unset or empty records no attention layer. |
 | `QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS` | `q,k,v,output` | Comma list of the tensors each selected attention layer writes. |
+| `QUANT_SUITE_TENSOR_DUMP_MOE` | unset | Regular expression over vLLM's MoE layer names (`MoERunner.layer_name`, e.g. `model.layers.0.mlp.experts`), matched with `re.match`. Unset or empty records no MoE layer. See [MoE layers](#moe-layers). |
+| `QUANT_SUITE_TENSOR_DUMP_MOE_TENSORS` | `input,router_logits,topk_ids,topk_weights,output` | Comma list of the tensors each selected MoE layer writes, from those and `gemm2`. |
 | `VLLM_USE_V2_MODEL_RUNNER` | set by vLLM | Must be `0` while dumping: the V2 model runner's warmup forwards cannot be told apart from requests, so the dump refuses to start under it. |
 
 A step is one model forward. `QUANT_SUITE_TENSOR_DUMP_STEPS` and
@@ -139,14 +145,118 @@ kind of layer needs an attention backend whose metadata describes them:
   `FLASHINFER`'s metadata, read as above.
 
 An attention layer reads its own metadata entry; `q_start_pos` is
-`kv_len - q_len`. Linear and attention records share the step ids, and
-attention can be recorded without any linear `dump` stage.
+`kv_len - q_len`. Linear, attention and MoE records share the step ids, and
+attention and MoE layers can be recorded without any linear `dump` stage.
 
 A request is `decode` when it has one query token after position 0, and
 `prefill` otherwise, including chunked-prefill chunks. A step is `prefill` or
 `decode` when all its requests are, and `mixed` otherwise.
 
 A malformed value fails at startup with an error that names the variable.
+
+## MoE layers
+
+`QUANT_SUITE_TENSOR_DUMP_MOE` selects vLLM `MoERunner` layers (the layer
+`FusedMoE` builds, whatever its experts kernel) by name. Each selected layer
+writes, at each written step, one row per token of the step, in the step's
+token order, as linear layers do:
+
+| tensor | shape | source |
+| --- | --- | --- |
+| `input` | `[T, hidden_size]` | the layer's `hidden_states` argument: what the experts get |
+| `router_logits` | `[T, num_experts]` | the layer's `router_logits` argument |
+| `topk_ids` | `[T, top_k]` | vLLM's routed-experts capture: the expert ids the kernel routed each token to, written from inside a kernel that routes the tokens itself |
+| `topk_weights` | `[T, top_k]` | the routing weights the kernel applies, as it holds them: from the unfinalized output a `post_gemm2_hook` receives, or from the experts call when the routing runs before the kernel |
+| `gemm2` | `[T, top_k, hidden_size]` | opt-in: the unweighted output of the second expert GEMM for route `(t, k)`, i.e. expert `topk_ids[t, k]` applied to `input[t]`, before the top-k reduction; from the kernel's `post_gemm2_hook` |
+| `output` | `[T, hidden_size]` | the layer's output |
+
+- Everything recorded is a value the kernel computed; nothing is recomputed.
+  The first GEMM's and the activation's outputs never leave the kernel and are
+  not recorded; they can be recomputed from `input`, `topk_ids` and the expert
+  weights, and checked against `gemm2`.
+- Under tensor parallelism each rank holds a slice of every expert's
+  intermediate dimension, so `gemm2` is the rank's partial sum; the layout's
+  `intermediate_size_per_partition` and `tp_rank` say which slice. Summed over
+  the ranks it is the full second GEMM.
+- `input`, `router_logits` and, when the layer reduces its output, `output`
+  are the same on every tensor-parallel rank and are written by
+  tensor-parallel rank 0 only; the records of the other ranks leave them out
+  and say so with `replicated_on: 0`, and a rank whose selected tensors are
+  all of these still writes its records, with no tensors. `topk_ids`, `topk_weights` and `gemm2`
+  are written on every rank, so routing differences between ranks show. A
+  `QUANT_SUITE_TENSOR_DUMP_RANKS` that selects a rank but not its
+  tensor-parallel rank 0 raises `RuntimeError` at startup. The reader fills in
+  another rank's replicated tensors from rank 0's record when it reads both
+  ranks' directories.
+- Byte budget skew: rank 0 writes more per step than the other ranks, so with
+  `QUANT_SUITE_TENSOR_DUMP_MAX_BYTES` it can stop writing a step or more before
+  them. Their records of those steps lack the replicated tensors, and
+  `TensorDump.moe` raises `ValueError` for them when rank 0's directory is in
+  the dump. Size the budget for rank 0.
+- `gemm2` rows are gathered and copied to the host inside the hook, at most
+  32 MiB of them on the GPU at a time (`32 MiB // (top_k * hidden_size * b)`
+  tokens per chunk, at least one), so the dump adds at most that to the layer's GPU
+  memory, which vLLM's memory profiling does not see. The copies are
+  synchronous, so written steps are slower.
+- `gemm2` needs an experts kernel with a `post_gemm2_hook` (the experts
+  kernels of vLLM 0.30 have none), and `topk_ids` one that supports vLLM's
+  routed-experts capture (or a router that runs before the kernel); a selected
+  tensor the kernel cannot provide raises `NotImplementedError` at the first
+  forward. A kernel that routes and reduces the tokens itself without such a
+  hook exposes no routing weights: its records leave `topk_weights` out, with
+  a warning.
+- Expert weights are not recorded. The layout records what pairs the records
+  with the checkpoint's expert weights: read the experts' weights from the
+  checkpoint and take this rank's slice of the intermediate dimension. Some
+  kernels convert the weights in place into a kernel-specific layout, so the
+  layer's weight tensors after loading are not the plain matrices.
+- The wrapped hook gets its arguments untouched, and the routed-experts
+  capture only adds a buffer the kernel writes the ids into, so the layer's
+  output does not change.
+- Only `MoERunner` layers are recorded. Experts that are not `MoERunner`
+  layers (such as fused expert modules that dispatch tokens across
+  expert-parallel ranks themselves) are never matched, and fast paths that call
+  the experts kernel without the layer's forward (such as some quantized-input
+  paths for small batches) are not supported: a selected layer whose experts
+  run that way at a written step raises `RuntimeError`. When the pattern
+  matches no `MoERunner` by step 1, one warning says so.
+
+Once per layer and rank, at the first step the layer writes, a `moe_layout`
+record holds what the records need to be read:
+
+| field | value |
+| --- | --- |
+| `num_experts`, `num_local_experts`, `top_k` | expert counts and routes per token |
+| `hidden_size`, `intermediate_size`, `intermediate_size_per_partition` | the experts' sizes, and the share of the intermediate dimension this rank holds |
+| `activation`, `gated`, `has_bias` | vLLM's activation name (gated activations take `act(gate) * up`), and whether the experts have biases |
+| `dtype`, `weight_dtype` | the activation dtype and the experts' weight dtype |
+| `tp_rank`, `tp_size`, `ep_rank`, `ep_size` | the rank's place in the layer's parallel groups |
+| `routing_method`, `scoring_func`, `renormalize`, `use_grouped_topk`, `num_expert_group`, `topk_group` | the routing |
+| `has_e_score_correction_bias` | whether the routing adds a bias to the scores to select the experts; the bias itself is the record's `e_score_correction_bias` tensor |
+| `routed_scaling_factor`, `output_scaling_factor` | the factor the kernel's routing folds into the weights, and the one the layer applies to its output |
+| `apply_router_weight_on_input`, `custom_routing_function`, `hash_routing`, `swiglu_limit`, `swiglu_alpha`, `swiglu_beta` | further routing and activation settings |
+| `monolithic`, `quant_method`, `experts_kernel`, `post_gemm2_hook` | whether the kernel routes the tokens itself, and the class names of the quantization method, the experts kernel and the hook that finalizes its output |
+| `output_reduced` | whether the output is summed over the ranks, so every rank returns the same output |
+
+The layout does not depend on `QUANT_SUITE_TENSOR_DUMP_MOE_TENSORS`, so runs
+appended with other tensors keep it.
+
+Not supported, each raising `NotImplementedError` at the first forward (or at
+startup for context parallelism): expert, data, sequence and context
+parallelism, expert load balancing, MoE LoRA, latent MoE (routed input or
+output transforms), `router_logits` when the layer computes its logits itself
+(a gate inside the layer), and `output` when the layer adds shared experts to
+it. Both are in the default tensors, so such layers need
+`QUANT_SUITE_TENSOR_DUMP_MOE_TENSORS` set without them; the error names the
+tensor.
+
+Size per token and layer, with `b` bytes per activation element: `input` and
+`output` `hidden_size * b` each, `router_logits` `num_experts` times the logits'
+element size, `topk_ids` `2 * top_k` (int16 from a kernel that routes itself),
+`topk_weights` `top_k * b`, and `gemm2` `top_k * hidden_size * b` on every rank.
+For example, with `hidden_size` 4096, 256 experts with fp32 logits, `top_k` 8
+and bfloat16: 17,440 bytes on tensor-parallel rank 0 without `gemm2`, 32 bytes
+on each other rank, and 65,536 more on every rank with it.
 
 ## Output
 
@@ -162,17 +272,19 @@ $QUANT_SUITE_TENSOR_DUMP_DIR/
       <attention layer>/req000.k.pt
       <attention layer>/req000.v.pt
       <attention layer>/req000.output.pt
+      <MoE layer>/<tensor>.pt               # input, router_logits, topk_ids, ...
+    moe_layouts/<MoE layer>/e_score_correction_bias.pt
 ```
 
 Each `.pt` file holds one tensor, saved with `torch.save`. Layer directories
 use the layer name verbatim: the linear layer's prefix, and vLLM's
-`layer_name` for attention. No file is ever overwritten.
+`layer_name` for attention and MoE. No file is ever overwritten.
 
 `manifest.jsonl` indexes the files, one JSON object per line; read it rather
 than parsing paths. Every path is relative to `rank_<R>/`.
 
 - `run`: written at the first written step of each run. `format_version`
-  (2), `run` (0 for the first run in the directory, then 1, 2, ...),
+  (3; format 2, without MoE records, is still read), `run` (0 for the first run in the directory, then 1, 2, ...),
   `first_step` (the manifest step id of the run's process step 0), `rank`,
   `world_size`, `tp_rank`, `tp_size`, `options` and `torch_version`.
 - `step`: one per written step. `step`, `phase`, `num_actual_tokens`, and
@@ -202,7 +314,18 @@ than parsing paths. Every path is relative to `rank_<R>/`.
 | `kv_cache_dtype` | vLLM's KV-cache dtype setting of the layer (`auto` means unquantized) |
 | `backend` | vLLM's name for the attention backend that computed the output, e.g. `FLASH_ATTN` |
 
-`tensors` lists only the tensors that were written.
+- `moe`: `step`, `layer`, `tensors` (one row per token of the step, as for
+  `linear`), `replicated_tensors` (the selected tensors identical on every
+  tensor-parallel rank), `replicated_on` (`0` when the layer runs
+  tensor-parallel, so that only tensor-parallel rank 0 writes those, else
+  `null`), and `topk_weights_source` (`post_gemm2_hook`, `experts_call`, or
+  `null` when the weights are not recorded).
+- `moe_layout`: `step` (the step it was written at), `layer`, the layout
+  fields of [MoE layers](#moe-layers), and `tensors`, holding the
+  `e_score_correction_bias` with its `sha256` when the layer has one.
+
+`tensors` lists only the tensors that were written. The reader raises on a
+record kind it does not know, so that a merge never leaves files behind.
 
 ### Appending runs
 
@@ -215,7 +338,8 @@ A run whose rank directory already holds a `manifest.jsonl` appends to it:
   first written step, its current weight and bias are compared with the
   record by shape, dtype and SHA-256; a difference means a different model or
   recipe and raises `RuntimeError`. A weight file that no record lists also
-  raises;
+  raises. A MoE layout is checked the same way: its fields by value, its bias
+  by shape, dtype and SHA-256;
 - a manifest in another format, or with a line an interrupted run left
   incomplete, raises `RuntimeError`.
 
@@ -276,8 +400,10 @@ alone. For each rank:
 <dst>/rank_<R>/
   manifest.json
   weights/<layer>.pt                 # {"weight": W, "bias": b}
+  moe_layouts/<layer>.pt             # {"e_score_correction_bias": b}
   req_<NNNN>/prefill/<layer>.pt      # linear: {"input", "output"}
   req_<NNNN>/decode/<layer>.pt       # attention: {"q", "k", "v", "output"}
+                                     # MoE: {"input", "router_logits", ...}
 ```
 
 - `<NNNN>` is the request's `id` (see [Reading a dump](#reading-a-dump)).
@@ -287,7 +413,8 @@ alone. For each rank:
   order, which is position order: every prefill chunk, then one row per
   decode step. Linear `input` is `[T, in]` and `output` `[T, out]`;
   attention `q` and `output` are `[T, num_q_heads, head_size]`, `k` and `v`
-  `[T, num_kv_heads, head_size]`. Dtypes are kept.
+  `[T, num_kv_heads, head_size]`; MoE tensors keep their trailing dims
+  (`gemm2` is `[T, top_k, hidden_size]`). Dtypes are kept.
 - `k` and `v` hold each step's new rows, so for a request whose prefill rows
   come before its decode rows, the full keys of decode row `i` are
   `cat([prefill["k"], decode["k"][: i + 1]])`.
@@ -298,7 +425,9 @@ alone. For each rank:
   `kv_len`; row `row_start + j` is at position `q_start_pos + j`), each
   layer's file, shapes and dtypes, and each attention layer's `replay`
   fields other than the positions the segments give. Fields that change
-  between steps are stored per row range (`replay_ranges`) instead.
+  between steps are stored per row range (`replay_ranges`) instead. Per MoE
+  layer, `moe_layouts` keeps the layout `fields`, the `step` it was written
+  at, and its file (`null` without a bias), shapes, dtypes and SHA-256.
 - Per request it also records `prompt_len`, `generated_len`,
   `starts_at_zero` (its first step is in the dump), `may_continue` (its run
   did not write the next step, and a step filter, `MAX_STEPS` or the byte
@@ -311,9 +440,10 @@ alone. For each rank:
   was made from before the manifest lists it; a difference raises
   `RuntimeError`.
 - With `--delete-source`, the dump's files are deleted once everything made
-  from them is verified: a step directory once every request with rows in
-  it is, a weight once its merged copy is, and each rank's `manifest.jsonl`
-  last. Files no manifest lists are never deleted.
+  from them is verified: a step directory, MoE files included, once every
+  request with rows in it is, a weight or MoE layout once its merged copy is,
+  and each rank's `manifest.jsonl` last. Files no manifest lists are never
+  deleted.
 - Only bytes verified against the merged copy are ever deleted. When
   `--delete-source` resumes a merge, the merged files of requests and weights
   an earlier run wrote are read again and compared bit for bit with the
@@ -359,6 +489,12 @@ for pair in dump.linear_pairs(phase="decode", layer=r"model\.layers\.0\."):
 print(dump.attention_layers())  # by name, layers.2 before layers.10
 prefill = dump.phase_tensors(layer, request, "prefill")  # or the request's id
 # {"q": [prompt_len, Hq, D], "k": ..., "v": ..., "output": ...}
+
+moe_layer = dump.moe_layers()[0]
+layout = dump.moe_layout(moe_layer)  # .fields, .e_score_correction_bias
+moe = dump.moe(moe_layer, request.steps[0])
+# moe.input: [T, hidden]; moe.topk_ids, moe.topk_weights: [T, top_k];
+# moe.gemm2: [T, top_k, hidden]; None where not written on this rank
 ```
 
 - Tensors load on demand, and each is checked against the shape and dtype its
@@ -376,8 +512,12 @@ prefill = dump.phase_tensors(layer, request, "prefill")  # or the request's id
   (see [Request boundaries](#request-boundaries)).
 - `dump.phase_tensors` returns a merged file's tensors as they are, and
   builds the same tensors from the per-step files of a dump as written.
-- In a merged dump, a step's linear tensors are assembled from the files of
-  its requests, and exist only for steps whose every request was merged.
+- On a tensor-parallel rank other than 0, `dump.phase_tensors` leaves out a
+  MoE layer's replicated tensors (its `replicated_tensors`): read them from
+  the request on tensor-parallel rank 0, or use `dump.moe`.
+- In a merged dump, a step's linear and MoE tensors are assembled from the
+  files of its requests, and exist only for steps whose every request was
+  merged.
 - A file that cannot be read as a torch file raises `ValueError` naming it,
   and so does a malformed manifest, with its line for `manifest.jsonl`.
 
@@ -489,7 +629,10 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
   and are never matched.
 - The bidirectional ranges of multimodal prefix-LM models are not recorded;
   records of text-only requests replay as causal.
-- MoE expert GEMMs, `lm_head` and the embedding are not recorded.
+- MoE layers: expert weights, the first expert GEMM and the activation output
+  are not recorded, nor are routers, gates and other projections that are
+  not QuantSuite linear layers; see [MoE layers](#moe-layers) for the
+  unsupported variants. `lm_head` and the embedding are not recorded.
 - Eager execution only.
 - Under `FLASHINFER`, a step whose prefills or decodes run on FlashInfer's
   native wrappers raises `RuntimeError` (see
@@ -527,6 +670,20 @@ pytest experimental/tensor_dump/tests
   example recipe, the checks made when an executor is built, and the
   rejection of `dump` stages in attention recipes.
 - `test_options.py`: the environment variables and their errors.
+- `test_dump_moe.py`: the MoE hooks on a stand-in for vLLM's `MoERunner`
+  (a kernel that routes itself with a `post_gemm2_hook`, one without, and a
+  router before the kernel): the recorded values, route-major `gemm2` rows
+  and unchanged outputs, rows cut to the step's tokens, dummy forwards and
+  unselected steps, the layout record, tensors written by tensor-parallel
+  rank 0 only, `gemm2` copied in chunks, the unsupported variants (with the
+  default tensors where they name one), an existing routed-experts capture, a
+  layer name vLLM cannot index, experts run without the layer's forward, the
+  warning for a pattern that matches nothing, a rank filter without
+  tensor-parallel rank 0, and the hooks removed again; then the reader, phase
+  tensors, merge, `--delete-source`, an unknown record kind, format 2 still
+  read, the layout check of an appended run with other tensors, and another
+  rank's replicated tensors read from rank 0, or refused for a step rank 0
+  did not write.
 - `test_dump_append.py`: runs appended to one directory (step ids, unchanged
   files, weights checked instead of rewritten, and the errors for a different
   weight, an unlisted weight file, another format and a truncated manifest),

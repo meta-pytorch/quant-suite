@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Reads a dump directory: steps, requests, linear operands and attention
-inputs with their rebuilt key/value history.
+"""Reads a dump directory: steps, requests, linear operands, attention inputs
+with their rebuilt key/value history, and MoE tensors with their layouts.
 
 ``TensorDump(path)`` parses every ``rank_<R>/manifest.jsonl`` under ``path``,
 or, for a dump that ``tensor_dump.merge`` merged, every
@@ -27,7 +27,7 @@ from typing import Any
 
 import torch
 
-_FORMAT_VERSIONS: frozenset[int] = frozenset({2})
+_FORMAT_VERSIONS: frozenset[int] = frozenset({2, 3})
 _MERGED_FORMAT_VERSIONS: frozenset[int] = frozenset({1})
 _MANIFEST = "manifest.jsonl"
 _MERGED_MANIFEST = "manifest.json"
@@ -388,6 +388,65 @@ class AttentionTensors:
 
 
 @dataclass(frozen=True)
+class MoELayout:
+    """One MoE layer's layout record on one rank.
+
+    Attributes:
+        rank, layer: Where the layout comes from.
+        step: The step the dump wrote it at.
+        fields: The record's fields: expert counts and sizes (``num_experts``,
+            ``num_local_experts``, ``top_k``, ``hidden_size``,
+            ``intermediate_size``, ``intermediate_size_per_partition``),
+            ``activation`` and ``gated``, dtypes, parallelism (``tp_rank``,
+            ``tp_size``, ``ep_rank``, ``ep_size``), routing parameters
+            (``routing_method``, ``scoring_func``, ``renormalize``,
+            ``has_e_score_correction_bias``, ``routed_scaling_factor``, ...), the
+            kernel classes and ``output_reduced``.
+        e_score_correction_bias: The bias the routing adds to the expert scores
+            to select the experts, if the layer has one.
+    """
+
+    rank: int
+    layer: str
+    step: int
+    fields: Mapping[str, object]
+    e_score_correction_bias: TensorRef | None
+
+
+@dataclass(frozen=True)
+class MoETensors:
+    """One MoE layer's tensors at one step; ``None`` where none was written.
+
+    The tensors identical on every tensor-parallel rank, ``replicated_tensors``,
+    are written by tensor-parallel rank 0 only; for another rank they are read
+    from rank 0's record when the dump holds rank 0's directory.
+
+    Attributes:
+        input: ``[tokens, hidden_size]``, the layer's ``hidden_states``.
+        router_logits: ``[tokens, num_experts]``.
+        topk_ids: ``[tokens, top_k]``, the expert each token's route ``k``
+            goes to.
+        topk_weights: ``[tokens, top_k]``, the weight of each route.
+        gemm2: ``[tokens, top_k, hidden_size]``, the unweighted output of the
+            second expert GEMM of each route, summed over this rank's share of
+            the intermediate dimension only.
+        output: The layer's output, ``[tokens, hidden_size]``.
+        replicated_tensors: The selected tensors identical on every
+            tensor-parallel rank.
+        layout: The layer's layout on the rank.
+    """
+
+    input: torch.Tensor | None
+    router_logits: torch.Tensor | None
+    topk_ids: torch.Tensor | None
+    topk_weights: torch.Tensor | None
+    gemm2: torch.Tensor | None
+    output: torch.Tensor | None
+    replicated_tensors: tuple[str, ...]
+    layout: MoELayout
+
+
+@dataclass(frozen=True)
 class _AttentionRecord:
     tensors: Mapping[str, TensorRef]
     replay: AttentionReplay
@@ -423,6 +482,11 @@ class _History:
         self.slices += 1
 
 
+# Per (layer, step): the token_start and row references of each request's
+# rows in merged files.
+_MergedRows = dict[tuple[str, int], list[tuple[int, dict[str, _RowsRef]]]]
+
+
 def _entry(root: Path, data: Mapping[str, Any]) -> TensorRef:
     size = data.get("bytes")
     checksum = data.get("sha256")
@@ -437,6 +501,16 @@ def _entry(root: Path, data: Mapping[str, Any]) -> TensorRef:
 
 def _entries(root: Path, record: Mapping[str, Any]) -> dict[str, TensorRef]:
     return {str(name): _entry(root, data) for name, data in record["tensors"].items()}
+
+
+def _replication(data: Mapping[str, Any]) -> tuple[int | None, tuple[str, ...]]:
+    """``replicated_on`` and ``replicated_tensors`` of a MoE record or merged
+    MoE layer."""
+    replicated_on = data.get("replicated_on")
+    return (
+        None if replicated_on is None else int(replicated_on),
+        tuple(str(name) for name in data.get("replicated_tensors", ())),
+    )
 
 
 def _replay(data: Mapping[str, Any]) -> AttentionReplay:
@@ -510,6 +584,12 @@ class TensorDump:
         self._linear: dict[tuple[int, str, int], dict[str, TensorRef]] = {}
         self._weights: dict[tuple[int, str], dict[str, TensorRef]] = {}
         self._attention: dict[tuple[int, str, int, int], _AttentionRecord] = {}
+        self._moe: dict[tuple[int, str, int], dict[str, TensorRef]] = {}
+        # Per MoE record: replicated_on and replicated_tensors.
+        self._moe_fields: dict[
+            tuple[int, str, int], tuple[int | None, tuple[str, ...]]
+        ] = {}
+        self._moe_layouts: dict[tuple[int, str], MoELayout] = {}
         self._requests: dict[int, tuple[Request, ...]] = {}
         self._histories: OrderedDict[tuple[int, str, int], _History] = OrderedDict()
         self._weight_cache: tuple[tuple[int, str], LinearTensors] | None = None
@@ -672,7 +752,11 @@ class TensorDump:
         of each step stacked along dim 0 in step order: linear ``input`` and
         ``output``, attention ``q``, ``k``, ``v`` and ``output`` (``k`` and
         ``v`` hold the new rows of each step, so the request's full keys at
-        a step are its rows of every step up to it).
+        a step are its rows of every step up to it), and the MoE tensors.
+
+        On a tensor-parallel rank other than 0, a MoE layer's replicated
+        tensors (its ``replicated_tensors``) are not among them: read them
+        from the request on tensor-parallel rank 0, or use ``moe``.
 
         Args:
             layer: The layer.
@@ -720,6 +804,98 @@ class TensorDump:
         names = {layer for (owner, layer, _, _) in self._attention if owner == rank}
         return tuple(sorted(names, key=_natural_key))
 
+    def moe_layers(self, *, rank: int = 0) -> tuple[str, ...]:
+        """The MoE layers with a layout on ``rank``, ordered by name with
+        digit runs compared as numbers."""
+        self._runs_of(rank)
+        names = {layer for (owner, layer) in self._moe_layouts if owner == rank}
+        return tuple(sorted(names, key=_natural_key))
+
+    def moe_layout(self, layer: str, *, rank: int = 0) -> MoELayout:
+        """``layer``'s layout on ``rank``.
+
+        Raises:
+            KeyError: if the layer has no layout on the rank.
+        """
+        layout = self._moe_layouts.get((rank, layer))
+        if layout is None:
+            raise KeyError(f"rank {rank} has no MoE layout for layer {layer!r}")
+        return layout
+
+    def moe(self, layer: str, step: int, *, rank: int = 0) -> MoETensors:
+        """``layer``'s MoE tensors at ``step`` on ``rank``.
+
+        The tensors identical on every tensor-parallel rank are read from the
+        record of the rank's tensor-parallel rank 0 when the dump holds its
+        directory; otherwise they are ``None`` on other ranks.
+
+        Raises:
+            KeyError: if the layer wrote nothing at that step, or has no
+                layout.
+            ValueError: if the dump holds the directory of the rank's
+                tensor-parallel rank 0, but that rank wrote no record of the
+                layer at the step, as when its byte budget ran out first.
+        """
+        key = (rank, layer, step)
+        refs = self._moe.get(key)
+        if refs is None:
+            raise KeyError(f"no MoE record for layer {layer!r} at step {step}")
+        replicated_on, replicated = self._moe_fields.get(key, (None, ()))
+        refs = {**refs, **self._replicated_refs(key, replicated_on, replicated)}
+        return MoETensors(
+            input=_load(refs.get("input")),
+            router_logits=_load(refs.get("router_logits")),
+            topk_ids=_load(refs.get("topk_ids")),
+            topk_weights=_load(refs.get("topk_weights")),
+            gemm2=_load(refs.get("gemm2")),
+            output=_load(refs.get("output")),
+            replicated_tensors=replicated,
+            layout=self.moe_layout(layer, rank=rank),
+        )
+
+    def _replicated_refs(
+        self,
+        key: tuple[int, str, int],
+        replicated_on: int | None,
+        replicated: tuple[str, ...],
+    ) -> dict[str, TensorRef]:
+        """The replicated tensors of a MoE record of another tensor-parallel
+        rank, from the record of the rank that writes them."""
+        rank, layer, step = key
+        tp_rank = self.moe_layout(layer, rank=rank).fields.get("tp_rank")
+        if replicated_on is None or not isinstance(tp_rank, int):
+            return {}
+        if tp_rank == replicated_on:
+            return {}
+        # Ranks are numbered with the tensor-parallel rank innermost.
+        writer = rank - tp_rank + replicated_on
+        if writer not in self._runs:
+            return {}
+        refs = self._moe.get((writer, layer, step))
+        if refs is None:
+            raise ValueError(
+                f"rank {writer}, which alone writes {list(replicated)} of MoE layer "
+                f"{layer!r}, wrote no record of it at step {step}, which rank "
+                f"{rank} wrote; its byte budget may have run out first"
+            )
+        return {name: refs[name] for name in replicated if name in refs}
+
+    def _moe_records(
+        self, rank: int
+    ) -> Iterator[tuple[str, int, Mapping[str, TensorRef]]]:
+        """``(layer, step, tensors)`` of each of ``rank``'s MoE records."""
+        for (owner, layer, step), refs in self._moe.items():
+            if owner == rank:
+                yield layer, step, refs
+
+    def _moe_layouts_of(self, rank: int) -> dict[str, MoELayout]:
+        """``rank``'s MoE layouts per layer."""
+        return {
+            layer: layout
+            for (owner, layer), layout in self._moe_layouts.items()
+            if owner == rank
+        }
+
     def _attention_records(
         self, rank: int
     ) -> Iterator[tuple[str, int, int, Mapping[str, TensorRef]]]:
@@ -746,10 +922,11 @@ class TensorDump:
     def _slice_tensors(
         self, layer: str, request: Request, piece: RequestSlice
     ) -> dict[str, torch.Tensor]:
-        linear = self._linear.get((request.rank, layer, piece.step))
-        if linear is not None:
-            rows = slice(piece.token_start, piece.token_start + piece.q_len)
-            return {name: ref.load()[rows] for name, ref in linear.items()}
+        rows = slice(piece.token_start, piece.token_start + piece.q_len)
+        for records in (self._linear, self._moe):
+            refs = records.get((request.rank, layer, piece.step))
+            if refs is not None:
+                return {name: ref.load()[rows] for name, ref in refs.items()}
         record = self._attention.get((request.rank, layer, piece.step, piece.request))
         if record is not None:
             return {name: ref.load() for name, ref in record.tensors.items()}
@@ -831,6 +1008,27 @@ class TensorDump:
             self._attention[key] = _AttentionRecord(
                 _entries(root, record), _replay(record["replay"])
             )
+        elif kind == "moe":
+            key = (rank, str(record["layer"]), step)
+            self._moe[key] = _entries(root, record)
+            self._moe_fields[key] = _replication(record)
+        elif kind == "moe_layout":
+            layer = str(record["layer"])
+            refs = _entries(root, record)
+            fields = {
+                key: value
+                for key, value in record.items()
+                if key not in ("record", "step", "layer", "tensors")
+            }
+            self._moe_layouts[(rank, layer)] = MoELayout(
+                rank=rank,
+                layer=layer,
+                step=step,
+                fields=fields,
+                e_score_correction_bias=refs.get("e_score_correction_bias"),
+            )
+        else:
+            raise ValueError(f"{root}: unknown record kind {kind!r}")
 
     def _read_merged(self, rank: int, root: Path) -> None:
         path = root / _MERGED_MANIFEST
@@ -877,7 +1075,21 @@ class TensorDump:
                 for name, data in entry["tensors"].items()
             }
             self._weights[(rank, str(layer))] = weights
-        linear: dict[tuple[str, int], list[tuple[int, dict[str, _RowsRef]]]] = {}
+        for layer, entry in manifest.get("moe_layouts", {}).items():
+            file = entry["file"]
+            refs = {
+                str(name): self._rows_ref(root / str(file), name, data, None)
+                for name, data in entry["tensors"].items()
+            }
+            self._moe_layouts[(rank, str(layer))] = MoELayout(
+                rank=rank,
+                layer=str(layer),
+                step=int(entry["step"]),
+                fields=dict(entry["fields"]),
+                e_score_correction_bias=refs.get("e_score_correction_bias"),
+            )
+        linear: _MergedRows = {}
+        moe: _MergedRows = {}
         requests = []
         for entry in manifest["requests"]:
             request = int(entry["request"])
@@ -890,7 +1102,8 @@ class TensorDump:
                     )
                 for layer, layer_entry in data["layers"].items():
                     key = (rank, request, str(phase), str(layer))
-                    self._merged_layer(root, key, layer_entry, segments, linear)
+                    rows = moe if layer_entry["kind"] == "moe" else linear
+                    self._merged_layer(root, key, layer_entry, segments, rows)
             requests.append(
                 Request(
                     rank=rank,
@@ -900,7 +1113,8 @@ class TensorDump:
                 )
             )
         self._requests[rank] = tuple(sorted(requests, key=lambda r: r.id))
-        self._merged_linear(rank, steps, linear)
+        self._merged_rows(rank, steps, linear, self._linear)
+        self._merged_rows(rank, steps, moe, self._moe)
 
     def _rows_ref(
         self,
@@ -931,9 +1145,11 @@ class TensorDump:
         key: tuple[int, int, str, str],
         entry: Mapping[str, Any],
         segments: list[Mapping[str, Any]],
-        linear: dict[tuple[str, int], list[tuple[int, dict[str, _RowsRef]]]],
+        rows_by_step: _MergedRows,
     ) -> None:
-        """Index one merged file by step, as the per-step records would be."""
+        """Index one merged file by step, as the per-step records would be:
+        linear and MoE rows into ``rows_by_step``, attention records into the
+        reader."""
         rank, _, _, layer = key
         file = root / str(entry["file"])
         tensors = entry["tensors"]
@@ -942,7 +1158,7 @@ class TensorDump:
             for name, data in tensors.items()
         }
         kind = entry["kind"]
-        if kind not in ("linear", "attention"):
+        if kind not in ("linear", "attention", "moe"):
             raise ValueError(f"{file} holds a layer of kind {kind!r}")
         for segment in segments:
             start = int(segment["row_start"])
@@ -952,8 +1168,10 @@ class TensorDump:
                 str(name): self._rows_ref(file, name, data, rows)
                 for name, data in tensors.items()
             }
-            if kind == "linear":
-                linear.setdefault((layer, step), []).append(
+            if kind == "moe":
+                self._moe_fields[(rank, layer, step)] = _replication(entry)
+            if kind != "attention":
+                rows_by_step.setdefault((layer, step), []).append(
                     (int(segment["token_start"]), refs)
                 )
                 continue
@@ -966,23 +1184,28 @@ class TensorDump:
             record_key = (rank, layer, step, int(segment["request"]))
             self._attention[record_key] = _AttentionRecord(refs, _replay(replay))
 
-    def _merged_linear(
+    def _merged_rows(
         self,
         rank: int,
         steps: Mapping[int, Step],
-        linear: Mapping[tuple[str, int], list[tuple[int, dict[str, _RowsRef]]]],
+        rows_by_step: _MergedRows,
+        records: dict[tuple[int, str, int], dict[str, TensorRef]],
     ) -> None:
-        """A step's linear records: its requests' rows in row order, for
-        steps whose requests' files cover every row."""
-        for (layer, step), pieces in linear.items():
+        """A step's linear or MoE records: its requests' rows in row order,
+        for steps whose requests' files cover every row."""
+        for (layer, step), pieces in rows_by_step.items():
             written = steps.get(step)
             if written is None or len(pieces) != len(written.requests):
                 continue
             pieces = sorted(pieces, key=lambda piece: piece[0])
             names = sorted(pieces[0][1])
+            if not names:
+                if not any(refs for _, refs in pieces):
+                    records[(rank, layer, step)] = {}
+                continue
             end = 0
             for token_start, refs in pieces:
-                if not names or token_start != end or sorted(refs) != names:
+                if token_start != end or sorted(refs) != names:
                     end = -1
                     break
                 end += refs[names[0]].shape[0]
@@ -1000,7 +1223,7 @@ class TensorDump:
                     ),
                     cache=self._files,
                 )
-            self._linear[(rank, layer, step)] = tensors
+            records[(rank, layer, step)] = tensors
 
     def _pair(self, rank: int, layer: str, step: int) -> LinearPair:
         tensors = self._linear[(rank, layer, step)]
@@ -1176,6 +1399,8 @@ __all__ = [
     "AttentionTensors",
     "LinearPair",
     "LinearTensors",
+    "MoELayout",
+    "MoETensors",
     "Request",
     "RequestSlice",
     "Run",

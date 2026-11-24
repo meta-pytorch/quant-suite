@@ -13,14 +13,18 @@ Layout under the output root, with every manifest path relative to
     rank_<R>/weights/<layer>/weight.pt          (and bias.pt)
     rank_<R>/step_<NNNNNN>/<layer>/input.pt     (and output.pt)
     rank_<R>/step_<NNNNNN>/<layer>/req<NNN>.<q|k|v|output>.pt
+    rank_<R>/step_<NNNNNN>/<layer>/<moe tensor>.pt
+    rank_<R>/moe_layouts/<layer>/e_score_correction_bias.pt
 
 Attention ``k`` and ``v`` hold the rows of the step's new tokens only: rows
-``[q_start_pos, kv_len)`` of the request's keys and values.
+``[q_start_pos, kv_len)`` of the request's keys and values. MoE tensors hold one
+row per token of the step, in the step's token order, as linear tensors do.
 
 A run appends to the rank's manifest when it exists: it adds a ``run`` record,
 numbers its steps after the largest step id already recorded, and never
-overwrites a file. A weight already recorded is checked against the layer's
-current weight by shape, dtype and SHA-256 instead of being written again.
+overwrites a file. A weight or MoE layout already recorded is checked against
+the layer's current one instead of being written again: tensors by shape, dtype
+and SHA-256, layout fields by value.
 """
 
 from __future__ import annotations
@@ -38,7 +42,8 @@ from tensor_dump import _step
 from tensor_dump._options import _DumpOptions
 from tensor_dump._step import _RequestInfo, _StepInfo
 
-_FORMAT_VERSION = 2
+# Format 3 adds the moe and moe_layout records to format 2.
+_FORMAT_VERSION = 3
 _LAYER_NAME_RE: re.Pattern[str] = re.compile(r"[A-Za-z0-9_.-]+")
 
 
@@ -69,6 +74,23 @@ class _AttentionLayout:
     logits_soft_cap: float | None
     kv_cache_dtype: str
     backend: str | None
+
+
+@dataclass(frozen=True)
+class _MoELayout:
+    """What a MoE layer's records need to be read: shapes, parallelism,
+    routing parameters and kernel, as JSON values in ``fields``.
+
+    Attributes:
+        layer: vLLM's name for the layer.
+        fields: The layout record's fields.
+        bias: The expert score correction bias the routing adds to the scores
+            to select the experts, if any.
+    """
+
+    layer: str
+    fields: dict[str, object]
+    bias: torch.Tensor | None
 
 
 def _to_host(tensor: torch.Tensor) -> torch.Tensor:
@@ -115,8 +137,13 @@ class _Writer:
         self._runs = 0
         self._first_step = 0
         self._bytes = 0
-        self._recorded_weights: dict[str, dict[str, Any]] = {}
+        # The weight and moe_layout records of earlier runs, per layer.
+        self._recorded: dict[str, dict[str, dict[str, Any]]] = {
+            "weight": {},
+            "moe_layout": {},
+        }
         self._weights_written: set[str] = set()
+        self._layouts_written: set[str] = set()
 
     def total_bytes(self) -> int:
         """The bytes of the rank's manifest and of every file it lists,
@@ -267,6 +294,57 @@ class _Writer:
                 }
             )
 
+    def moe(
+        self,
+        step: _StepInfo,
+        layout: _MoELayout,
+        tensors: dict[str, torch.Tensor],
+        fields: dict[str, object],
+        host_copies: frozenset[str] = frozenset(),
+    ) -> None:
+        """Write a MoE layer's record and tensors, which hold one row per
+        token of the step, and its layout once.
+
+        Args:
+            step: The step.
+            layout: The layer's layout.
+            tensors: The tensors this rank writes; none on a rank whose
+                selected tensors are all written by ``replicated_on``.
+            fields: The record's other fields: ``replicated_on``, the
+                tensor-parallel rank that alone writes the tensors identical
+                on every rank (``None`` when every rank writes all of its
+                tensors), ``replicated_tensors``, those tensors, and
+                ``topk_weights_source``.
+            host_copies: The tensors that are already compact host copies
+                nothing else holds; they are written without another copy.
+
+        Raises:
+            RuntimeError: if the layout differs from the one an earlier run
+                recorded.
+        """
+        layer = layout.layer
+        _check_layer_name(layer)
+        if layer not in self._layouts_written:
+            self._moe_layout(step, layout)
+        directory = f"step_{self._step_id(step):06d}/{layer}"
+        entries = {
+            name: self._save(
+                f"{directory}/{name}.pt",
+                tensor if name in host_copies else _to_host(tensor),
+            )
+            for name, tensor in sorted(tensors.items())
+        }
+        record: dict[str, object] = dict(fields)
+        record.update(
+            {
+                "record": "moe",
+                "step": self._step_id(step),
+                "layer": layer,
+                "tensors": entries,
+            }
+        )
+        self._record(record)
+
     def close(self) -> None:
         if self._manifest is not None:
             self._manifest.close()
@@ -312,8 +390,9 @@ class _Writer:
                     )
             elif kind == "step":
                 last_step = max(last_step, int(record["step"]))
-            elif kind == "weight":
-                self._recorded_weights[str(record["layer"])] = record["tensors"]
+            recorded = self._recorded.get(kind)
+            if recorded is not None:
+                recorded[str(record["layer"])] = record
             for entry in record.get("tensors", {}).values():
                 size = entry.get("bytes")
                 if size is None:
@@ -376,9 +455,11 @@ class _Writer:
         if bias is not None:
             hosts["bias"] = _to_host(bias)
         self._weights_written.add(layer)
-        recorded = self._recorded_weights.get(layer)
+        recorded = self._recorded["weight"].get(layer)
         if recorded is not None:
-            self._check_weight(layer, recorded, hosts)
+            self._check_tensors(
+                f"layer {layer!r}", "weights", recorded["tensors"], hosts
+            )
             return
         root = self._root
         if root is not None and (root / f"weights/{layer}").exists():
@@ -399,12 +480,68 @@ class _Writer:
             }
         )
 
-    def _check_weight(
-        self, layer: str, recorded: dict[str, Any], hosts: dict[str, torch.Tensor]
+    def _moe_layout(self, step: _StepInfo, layout: _MoELayout) -> None:
+        """Write the MoE layer's layout record and bias, or check them against
+        the ones an earlier run recorded.
+
+        Raises:
+            RuntimeError: if the recorded layout differs, or a layout file
+                exists that no record lists.
+        """
+        layer = layout.layer
+        hosts: dict[str, torch.Tensor] = {}
+        if layout.bias is not None:
+            hosts["e_score_correction_bias"] = _to_host(layout.bias)
+        self._layouts_written.add(layer)
+        recorded = self._recorded["moe_layout"].get(layer)
+        if recorded is not None:
+            fields = {
+                key: value
+                for key, value in recorded.items()
+                if key not in ("record", "step", "layer", "tensors")
+            }
+            # Compare as JSON values, as the record holds them.
+            if json.loads(json.dumps(layout.fields)) != fields:
+                raise RuntimeError(
+                    f"MoE layer {layer!r} has a layout that differs from the one "
+                    f"an earlier run recorded in {self._options.directory}, so it "
+                    "runs a different model or setting; use a new directory"
+                )
+            self._check_tensors(
+                f"MoE layer {layer!r}", "layout", recorded.get("tensors", {}), hosts
+            )
+            return
+        root = self._root
+        if root is not None and (root / f"moe_layouts/{layer}").exists():
+            raise RuntimeError(
+                f"{root / 'moe_layouts' / layer} exists but no moe_layout record "
+                "lists it; use a new directory"
+            )
+        entries = {
+            name: self._save(f"moe_layouts/{layer}/{name}.pt", host, checksum=True)
+            for name, host in hosts.items()
+        }
+        record: dict[str, object] = dict(layout.fields)
+        record.update(
+            {
+                "record": "moe_layout",
+                "step": self._step_id(step),
+                "layer": layer,
+                "tensors": entries,
+            }
+        )
+        self._record(record)
+
+    def _check_tensors(
+        self,
+        owner: str,
+        kind: str,
+        recorded: dict[str, Any],
+        hosts: dict[str, torch.Tensor],
     ) -> None:
         def differs(reason: str) -> RuntimeError:
             return RuntimeError(
-                f"layer {layer!r} {reason} in the weights an earlier run recorded "
+                f"{owner} {reason} in the {kind} an earlier run recorded "
                 f"in {self._options.directory}, so it runs a different model or "
                 "recipe; use a new directory"
             )
@@ -424,7 +561,7 @@ class _Writer:
             checksum = entry.get("sha256")
             if checksum is None:
                 raise RuntimeError(
-                    f"the recorded {name} of layer {layer!r} has no SHA-256 to "
+                    f"the recorded {name} of {owner} has no SHA-256 to "
                     "check against; use a new directory"
                 )
             if checksum != _sha256(host):

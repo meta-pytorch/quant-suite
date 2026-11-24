@@ -46,6 +46,8 @@ _ALLOWED_VLLM_MODULES: frozenset[str] = frozenset(
         "vllm.envs",
         "vllm.forward_context",
         "vllm.model_executor.layers.attention",
+        "vllm.model_executor.layers.fused_moe",
+        "vllm.model_executor.layers.fused_moe.routed_experts_capturer",
     }
 )
 

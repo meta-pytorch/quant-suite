@@ -10,7 +10,8 @@
 ``QUANT_SUITE_TENSOR_DUMP_DIR`` set, one whose recipe holds a ``dump`` stage
 also writes its selected tensors at the selected steps. Building any
 ``DumpLinear`` starts the dump session, which also hooks the attention layers
-that ``QUANT_SUITE_TENSOR_DUMP_ATTENTION`` selects.
+that ``QUANT_SUITE_TENSOR_DUMP_ATTENTION`` selects and the MoE layers that
+``QUANT_SUITE_TENSOR_DUMP_MOE`` selects.
 """
 
 from __future__ import annotations

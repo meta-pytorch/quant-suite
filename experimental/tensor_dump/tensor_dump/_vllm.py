@@ -12,6 +12,7 @@ recipe runtime load in environments without vLLM.
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 
@@ -29,6 +30,19 @@ def attention_class() -> type[Any]:
     from vllm.model_executor.layers.attention import Attention
 
     return Attention
+
+
+def moe_runner_class() -> type[Any]:
+    """vLLM's MoE layer class, which runs the router and the experts."""
+    return importlib.import_module("vllm.model_executor.layers.fused_moe").MoERunner
+
+
+def bind_routed_experts_capturer(module: Any, capturer: Any) -> None:
+    """Have the MoE layers in ``module`` call ``capturer.capture(layer_id,
+    topk_ids)`` with the expert ids each token is routed to."""
+    importlib.import_module(
+        "vllm.model_executor.layers.fused_moe.routed_experts_capturer"
+    ).bind_routed_experts_capturer(module, capturer)
 
 
 def tensor_parallel() -> tuple[int, int] | None:

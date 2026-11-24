@@ -4,20 +4,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Stand-ins for vLLM's forward context and attention layer, for the tests."""
+"""Stand-ins for vLLM's forward context, attention layer and MoE layer, for
+the tests."""
 
 import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
-from tensor_dump import _attention, _session, _step
+from tensor_dump import _attention, _moe, _session, _step
 from tensor_dump._step import _VllmSettings
 
 _ENV_PREFIX = "QUANT_SUITE_TENSOR_DUMP_"
@@ -215,6 +217,228 @@ class FakeAttention(torch.nn.Module):
         return query * 2 + 1
 
 
+class FakeExperts:
+    """The experts kernel object: ``post_gemm2_hook`` takes the unweighted
+    GEMM2 rows and reduces them into ``output``, as a deferred finalize does."""
+
+    def __init__(self, hook: bool) -> None:
+        if hook:
+            self.post_gemm2_hook = finalize
+
+
+def finalize(unfinalized: Any, output: torch.Tensor) -> None:
+    """The top-k weighted sum of an unfinalized output."""
+    rows = unfinalized.gemm2_permuted[
+        unfinalized.expanded_idx_to_permuted_idx.reshape(-1).long()
+    ]
+    tokens, top_k = unfinalized.expert_weights.shape
+    weights = unfinalized.expert_weights.reshape(tokens, top_k, 1)
+    output.copy_((rows.view(tokens, top_k, -1) * weights).sum(dim=1))
+
+
+class FakeRouter:
+    """A router that runs before the experts kernel, with vLLM's capture
+    callback."""
+
+    def __init__(self) -> None:
+        self.capture_fn: Any = None
+
+    def set_capture_fn(self, capture_fn: Any) -> None:
+        self.capture_fn = capture_fn
+
+
+class FakeRoutedExperts(torch.nn.Module):
+    """The expert weights and routing parameters of vLLM's ``RoutedExperts``.
+
+    ``forward_modular`` computes the unweighted output of each route,
+    ``[tokens * top_k, hidden]``, route-major.
+    """
+
+    def __init__(
+        self, moe_config: Any, *, monolithic: bool, hook: bool, seed: int
+    ) -> None:
+        super().__init__()
+        generator = torch.Generator().manual_seed(seed)
+        experts = moe_config.num_experts
+        hidden = moe_config.hidden_dim
+        intermediate = moe_config.intermediate_size_per_partition
+        self.w13 = torch.randn(experts, 2 * intermediate, hidden, generator=generator)
+        self.w2 = torch.randn(experts, hidden, intermediate, generator=generator)
+        self.e_score_correction_bias = torch.randn(experts, generator=generator)
+        self.quant_method = SimpleNamespace(
+            is_monolithic=monolithic,
+            moe_kernel=SimpleNamespace(fused_experts=FakeExperts(hook)),
+        )
+        self.routing_sink: Any = None
+        self.params_dtype = torch.float32
+        self.scoring_func = "sigmoid"
+        self.renormalize = True
+        self.use_grouped_topk = False
+        self.num_expert_group = None
+        self.topk_group = None
+        self.routed_scaling_factor = 1.0
+        self.apply_router_weight_on_input = False
+        self.custom_routing_function = None
+
+    def forward_modular(
+        self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> torch.Tensor:
+        gate_up = torch.einsum("th,tkih->tki", x, self.w13[topk_ids])
+        gate, up = gate_up.chunk(2, dim=-1)
+        rows = torch.einsum(
+            "tki,tkhi->tkh", torch.nn.functional.silu(gate) * up, self.w2[topk_ids]
+        )
+        return rows.reshape(-1, rows.shape[-1])
+
+
+def fake_moe_config(
+    *,
+    experts: int = 6,
+    top_k: int = 2,
+    hidden: int = 8,
+    intermediate: int = 4,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    **parallel: Any,
+) -> SimpleNamespace:
+    """The ``FusedMoEConfig`` fields the dump reads; ``parallel`` overrides
+    fields of its ``moe_parallel_config``."""
+    parallel_config = SimpleNamespace(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        ep_rank=0,
+        ep_size=1,
+        dp_size=1,
+        pcp_size=1,
+        use_ep=False,
+        enable_eplb=False,
+        is_sequence_parallel=False,
+    )
+    for name, value in parallel.items():
+        setattr(parallel_config, name, value)
+    return SimpleNamespace(
+        num_experts=experts,
+        num_local_experts=experts,
+        experts_per_token=top_k,
+        hidden_dim=hidden,
+        intermediate_size=intermediate * tp_size,
+        intermediate_size_per_partition=intermediate,
+        activation=SimpleNamespace(value="silu"),
+        is_act_and_mul=True,
+        has_bias=False,
+        in_dtype=torch.float32,
+        routing_method=SimpleNamespace(name="MiniMax2"),
+        skip_final_all_reduce=False,
+        is_lora_enabled=False,
+        has_hash_routing=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        moe_parallel_config=parallel_config,
+    )
+
+
+class FakeMoERunner(torch.nn.Module):
+    """The attributes and calling sequence of vLLM's ``MoERunner``.
+
+    ``forward(hidden_states, router_logits)`` routes each token to its
+    ``top_k`` experts by sigmoid score plus the correction bias, with the
+    weights renormalized over the selected experts. A monolithic kernel fills
+    the routing sink and calls its capture callback; a modular one runs the
+    router first, which calls its capture callback, then ``forward_modular``.
+    With a ``post_gemm2_hook``, the GEMM2 rows reach it permuted into a padded
+    buffer, as a kernel that sorts tokens by expert hands them over.
+    """
+
+    def __init__(
+        self,
+        layer_name: str,
+        moe_config: Any | None = None,
+        *,
+        monolithic: bool = True,
+        hook: bool = True,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        self.layer_name = layer_name
+        self.layer_id = int(layer_name.split(".")[2])
+        self.moe_config = moe_config or fake_moe_config()
+        self.router = FakeRouter()
+        self.routed_experts = FakeRoutedExperts(
+            self.moe_config, monolithic=monolithic, hook=hook, seed=seed
+        )
+        self.gate = None
+        self.shared_experts = None
+        self.routed_input_transform = None
+        self.routed_output_transform = None
+        self.routed_scaling_factor = 1.0
+        # The routes of the last call: ids, weights and route-major rows.
+        self.last_routes: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+    def route(self, router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(topk_ids, topk_weights)`` of each token."""
+        scores = torch.sigmoid(router_logits)
+        biased = scores + self.routed_experts.e_score_correction_bias
+        ids = biased.topk(self.moe_config.experts_per_token, dim=-1).indices
+        weights = scores.gather(1, ids)
+        return ids, weights / weights.sum(dim=-1, keepdim=True)
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        routed = self.routed_experts
+        ids, weights = self.route(router_logits)
+        tokens, top_k = ids.shape
+        if routed.quant_method.is_monolithic:
+            sink = routed.routing_sink
+            if sink is not None:
+                replay = sink.buffer[:tokens]
+                replay.copy_(ids)
+                sink.capture_fn(replay)
+            rows = routed.forward_modular(hidden_states, weights, ids)
+        else:
+            if self.router.capture_fn is not None:
+                self.router.capture_fn(ids)
+            rows = routed.forward_modular(
+                x=hidden_states, topk_weights=weights, topk_ids=ids
+            )
+        self.last_routes = (ids, weights, rows.view(tokens, top_k, -1))
+        experts = routed.quant_method.moe_kernel.fused_experts
+        hook = getattr(experts, "post_gemm2_hook", None)
+        if hook is None:
+            return (rows.view(tokens, top_k, -1) * weights.unsqueeze(-1)).sum(dim=1)
+        # Rows in a shuffled order inside a buffer with two padding rows.
+        order = torch.randperm(
+            tokens * top_k, generator=torch.Generator().manual_seed(1)
+        )
+        permuted = torch.full((tokens * top_k + 2, rows.shape[-1]), float("nan"))
+        permuted[order] = rows
+        output = hidden_states.new_empty(tokens, rows.shape[-1])
+        hook(
+            SimpleNamespace(
+                gemm2_permuted=permuted,
+                expert_weights=weights,
+                expanded_idx_to_permuted_idx=order.view(tokens, top_k).int(),
+            ),
+            output,
+        )
+        return output
+
+
+def bind_fake_capture(module: FakeMoERunner, capturer: Any) -> None:
+    """``bind_routed_experts_capturer`` for one fake layer: a routing sink for
+    a monolithic kernel, the router's callback otherwise."""
+    capture_fn = partial(capturer.capture, module.layer_id)
+    routed = module.routed_experts
+    if routed.quant_method.is_monolithic:
+        top_k = module.moe_config.experts_per_token
+        routed.routing_sink = SimpleNamespace(
+            buffer=torch.empty(64, top_k, dtype=torch.int16), capture_fn=capture_fn
+        )
+    else:
+        module.router.set_capture_fn(capture_fn)
+
+
 @contextmanager
 def dump_session(
     directory: Path | None,
@@ -222,6 +446,7 @@ def dump_session(
     settings: _VllmSettings | None = None,
     real_vllm: bool = False,
     attention_class: type[torch.nn.Module] = FakeAttention,
+    moe_class: type[torch.nn.Module] = FakeMoERunner,
     **env: str,
 ) -> Iterator[FakeForward]:
     """A fresh dump session writing to ``directory``; for ``None``,
@@ -230,13 +455,21 @@ def dump_session(
     ``env`` sets the other variables by suffix, e.g. ``MAX_STEPS="2"``.
     ``settings`` stands in for the vLLM settings. With ``real_vllm``, the
     forward context, parallel state and settings come from vLLM itself.
-    ``attention_class`` stands in for vLLM's ``Attention`` class.
+    ``attention_class`` stands in for vLLM's ``Attention`` class and
+    ``moe_class`` for its ``MoERunner`` class, whose routed-experts capture
+    ``bind_fake_capture`` binds.
     """
     forward = FakeForward()
     with ExitStack() as stack:
         stack.enter_context(patch.dict(os.environ))
         stack.enter_context(
             patch.object(_attention, "_attention_class", return_value=attention_class)
+        )
+        stack.enter_context(
+            patch.object(_moe, "_moe_runner_class", return_value=moe_class)
+        )
+        stack.enter_context(
+            patch.object(_moe, "_bind_routing_capture", side_effect=bind_fake_capture)
         )
         if not real_vllm:
             stack.enter_context(

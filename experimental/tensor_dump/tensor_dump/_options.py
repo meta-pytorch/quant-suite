@@ -21,9 +21,15 @@ _RANKS_ENV = "QUANT_SUITE_TENSOR_DUMP_RANKS"
 _MAX_BYTES_ENV = "QUANT_SUITE_TENSOR_DUMP_MAX_BYTES"
 _ATTENTION_ENV = "QUANT_SUITE_TENSOR_DUMP_ATTENTION"
 _ATTENTION_TENSORS_ENV = "QUANT_SUITE_TENSOR_DUMP_ATTENTION_TENSORS"
+_MOE_ENV = "QUANT_SUITE_TENSOR_DUMP_MOE"
+_MOE_TENSORS_ENV = "QUANT_SUITE_TENSOR_DUMP_MOE_TENSORS"
 
 _PHASES: frozenset[str] = frozenset({"prefill", "decode", "mixed"})
 _ATTENTION_TENSORS: frozenset[str] = frozenset({"q", "k", "v", "output"})
+_MOE_TENSORS: frozenset[str] = frozenset(
+    {"input", "router_logits", "topk_ids", "topk_weights", "gemm2", "output"}
+)
+_DEFAULT_MOE_TENSORS: frozenset[str] = _MOE_TENSORS - {"gemm2"}
 _INT_RE: re.Pattern[str] = re.compile(r"[0-9]+")
 _RANGE_RE: re.Pattern[str] = re.compile(r"([0-9]+):([0-9]*)")
 _BYTES_RE: re.Pattern[str] = re.compile(r"([0-9]+)([KMGT]?)", re.IGNORECASE)
@@ -52,6 +58,9 @@ class _DumpOptions:
         attention: Attention layers that write, matched against vLLM's layer
             name with ``re.match``; ``None`` means no attention layer.
         attention_tensors: Tensors each selected attention layer writes.
+        moe: MoE layers that write, matched against vLLM's layer name with
+            ``re.match``; ``None`` means no MoE layer.
+        moe_tensors: Tensors each selected MoE layer writes.
     """
 
     directory: Path
@@ -62,6 +71,8 @@ class _DumpOptions:
     max_bytes: int
     attention: re.Pattern[str] | None
     attention_tensors: frozenset[str]
+    moe: re.Pattern[str] | None = None
+    moe_tensors: frozenset[str] = _DEFAULT_MOE_TENSORS
 
     def selects_step(self, step: int) -> bool:
         return any(
@@ -85,6 +96,9 @@ class _DumpOptions:
         attention: str | None = None
         if self.attention is not None:
             attention = self.attention.pattern
+        moe: str | None = None
+        if self.moe is not None:
+            moe = self.moe.pattern
         return {
             "steps": steps,
             "phase": phase,
@@ -93,6 +107,8 @@ class _DumpOptions:
             "max_bytes": self.max_bytes,
             "attention": attention,
             "attention_tensors": ",".join(sorted(self.attention_tensors)),
+            "moe": moe,
+            "moe_tensors": ",".join(sorted(self.moe_tensors)),
         }
 
 
@@ -167,25 +183,22 @@ def _parse_max_bytes(value: str) -> int:
     return int(match.group(1)) * _BYTE_UNITS[match.group(2).upper()]
 
 
-def _parse_attention(value: str) -> re.Pattern[str] | None:
+def _parse_pattern(name: str, value: str) -> re.Pattern[str] | None:
     if not value:
         return None
     try:
         return re.compile(value)
     except re.error as error:
         raise ValueError(
-            f"{_ATTENTION_ENV}={value!r} is not a regular expression: {error}"
+            f"{name}={value!r} is not a regular expression: {error}"
         ) from error
 
 
-def _parse_attention_tensors(value: str) -> frozenset[str]:
-    names = _items(_ATTENTION_TENSORS_ENV, value)
-    unknown = sorted(set(names) - _ATTENTION_TENSORS)
+def _parse_tensors(name: str, value: str, allowed: frozenset[str]) -> frozenset[str]:
+    names = _items(name, value)
+    unknown = sorted(set(names) - allowed)
     if unknown:
-        raise ValueError(
-            f"{_ATTENTION_TENSORS_ENV}={value!r}: {unknown} are not in "
-            f"{sorted(_ATTENTION_TENSORS)}"
-        )
+        raise ValueError(f"{name}={value!r}: {unknown} are not in {sorted(allowed)}")
     return frozenset(names)
 
 
@@ -206,8 +219,16 @@ def _options_from_environ(environ: Mapping[str, str]) -> _DumpOptions | None:
         max_steps=_parse_max_steps(environ.get(_MAX_STEPS_ENV, "1")),
         ranks=_parse_ranks(environ.get(_RANKS_ENV, "all")),
         max_bytes=_parse_max_bytes(environ.get(_MAX_BYTES_ENV, "0")),
-        attention=_parse_attention(environ.get(_ATTENTION_ENV, "")),
-        attention_tensors=_parse_attention_tensors(
-            environ.get(_ATTENTION_TENSORS_ENV, "q,k,v,output")
+        attention=_parse_pattern(_ATTENTION_ENV, environ.get(_ATTENTION_ENV, "")),
+        attention_tensors=_parse_tensors(
+            _ATTENTION_TENSORS_ENV,
+            environ.get(_ATTENTION_TENSORS_ENV, "q,k,v,output"),
+            _ATTENTION_TENSORS,
+        ),
+        moe=_parse_pattern(_MOE_ENV, environ.get(_MOE_ENV, "")),
+        moe_tensors=_parse_tensors(
+            _MOE_TENSORS_ENV,
+            environ.get(_MOE_TENSORS_ENV, ",".join(sorted(_DEFAULT_MOE_TENSORS))),
+            _MOE_TENSORS,
         ),
     )

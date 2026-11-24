@@ -40,9 +40,15 @@ class OptionsTest(unittest.TestCase):
         self.assertEqual(
             options.attention_tensors, frozenset({"q", "k", "v", "output"})
         )
-        empty = _parse(DIR="/tmp/dump", ATTENTION="")
+        self.assertIsNone(options.moe)
+        self.assertEqual(
+            options.moe_tensors,
+            frozenset({"input", "router_logits", "topk_ids", "topk_weights", "output"}),
+        )
+        empty = _parse(DIR="/tmp/dump", ATTENTION="", MOE="")
         assert empty is not None
         self.assertIsNone(empty.attention)
+        self.assertIsNone(empty.moe)
 
     def test_grammar(self) -> None:
         options = _parse(
@@ -70,6 +76,19 @@ class OptionsTest(unittest.TestCase):
         self.assertFalse(attention.match("model.layers.1.self_attn.attn"))
         self.assertEqual(options.attention_tensors, frozenset({"q", "output"}))
 
+    def test_moe_grammar(self) -> None:
+        options = _parse(
+            DIR="d",
+            MOE=r".*layers\.[0-9]+\.feed_forward\.experts$",
+            MOE_TENSORS="gemm2, topk_ids",
+        )
+        assert options is not None
+        moe = options.moe
+        assert moe is not None
+        self.assertTrue(moe.match("model.layers.12.feed_forward.experts"))
+        self.assertFalse(moe.match("model.layers.12.feed_forward.router"))
+        self.assertEqual(options.moe_tensors, frozenset({"gemm2", "topk_ids"}))
+
     def test_describe_round_trips(self) -> None:
         options = _parse(
             DIR="d",
@@ -79,6 +98,8 @@ class OptionsTest(unittest.TestCase):
             MAX_BYTES="20M",
             ATTENTION="layers",
             ATTENTION_TENSORS="v,q",
+            MOE="experts",
+            MOE_TENSORS="output,gemm2",
         )
         assert options is not None
         description = options.describe()
@@ -92,6 +113,8 @@ class OptionsTest(unittest.TestCase):
                 "max_bytes": 20_000_000,
                 "attention": "layers",
                 "attention_tensors": "q,v",
+                "moe": "experts",
+                "moe_tensors": "gemm2,output",
             },
         )
         self.assertEqual(
@@ -104,6 +127,8 @@ class OptionsTest(unittest.TestCase):
                 MAX_BYTES=str(description["max_bytes"]),
                 ATTENTION=str(description["attention"]),
                 ATTENTION_TENSORS=str(description["attention_tensors"]),
+                MOE=str(description["moe"]),
+                MOE_TENSORS=str(description["moe_tensors"]),
             ),
             options,
         )
@@ -132,6 +157,8 @@ class OptionsTest(unittest.TestCase):
             "MAX_BYTES": ["", "-1", "1.5G", "1KB", "G", "1 G"],
             "ATTENTION": ["(", "layers.[0"],
             "ATTENTION_TENSORS": ["", "p", "q,,k", "input"],
+            "MOE": ["(", "experts.[0"],
+            "MOE_TENSORS": ["", "q", "input,,output", "gemm1"],
         }
         for suffix, values in cases.items():
             for value in values:

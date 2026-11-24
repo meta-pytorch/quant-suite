@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "quant_suite_tensor_dump"
 dynamic = ["version"]
-description = "Records linear and attention tensors of a QuantSuite model as a QuantSuite extension"
+description = "Records linear, attention and MoE tensors of a QuantSuite model as a QuantSuite extension"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"

@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 
+import torch
 from tensor_dump import _step
 from tensor_dump._attention import _AttentionDump
+from tensor_dump._moe import _MoEDump
 from tensor_dump._naming import _NameResolver
 from tensor_dump._options import (
     _ATTENTION_ENV,
     _DIR_ENV,
     _DumpOptions,
+    _MOE_ENV,
     _options_from_environ,
+    _RANKS_ENV,
 )
 from tensor_dump._step import _StepTracker, _VllmSettings
 from tensor_dump._writer import _Writer
@@ -30,14 +35,16 @@ _UNQUANTIZED_KV_CACHE_DTYPES = frozenset({"auto", "bfloat16", "float16"})
 
 
 class _Session:
-    """The options, step tracker, writer, name resolver and attention hooks of
-    one process.
+    """The options, step tracker, writer, name resolver, and attention and
+    MoE hooks of one process.
 
     Raises:
-        RuntimeError: if vLLM's V2 model runner is enabled, or attention layers
+        RuntimeError: if vLLM's V2 model runner is enabled, attention layers
             are selected while vLLM's prefix caching is enabled or its KV cache
-            is quantized.
-        NotImplementedError: if speculative decoding is configured.
+            is quantized, or MoE layers are selected and this rank writes but
+            its tensor-parallel rank 0 does not.
+        NotImplementedError: if speculative decoding is configured, or MoE
+            layers are selected under context parallelism.
     """
 
     def __init__(self, options: _DumpOptions, settings: _VllmSettings) -> None:
@@ -73,24 +80,76 @@ class _Session:
                 "would not reproduce its output. Start vLLM with "
                 "--kv-cache-dtype auto"
             )
+        if options.moe is not None and settings.context_parallel:
+            raise NotImplementedError(
+                f"{_MOE_ENV} is set, and tensor_dump does not record MoE layers "
+                "under context parallelism"
+            )
+        if options.moe is not None:
+            _check_moe_ranks(options)
         self.options = options
         self.settings = settings
         self.resolver = _NameResolver()
         self.writer = _Writer(options)
         self.tracker = _StepTracker(
             options,
-            on_step=self.resolver.finish_from_second_step,
+            on_step=self._on_step,
             on_selected_step=self.writer.begin_step,
             total_bytes=self.writer.total_bytes,
             context_parallel=settings.context_parallel is True,
         )
         self.attention: _AttentionDump | None = None
+        self.moe: _MoEDump | None = None
+        visitors: list[Callable[[torch.nn.Module], None]] = []
         if pattern is not None:
-            attention = _AttentionDump(
+            self.attention = _AttentionDump(
                 pattern, options.attention_tensors, self.tracker, self.writer
             )
-            self.resolver.scan(attention.visit)
-            self.attention = attention
+            visitors.append(self.attention.visit)
+        if options.moe is not None:
+            self.moe = _MoEDump(
+                options.moe, options.moe_tensors, self.tracker, self.writer
+            )
+            visitors.append(self.moe.visit)
+        if visitors:
+            self.resolver.scan(_visit_all(visitors))
+
+    def _on_step(self, step: int) -> None:
+        self.resolver.finish_from_second_step(step)
+        if self.moe is not None:
+            self.moe.check_hooked(step)
+
+
+def _check_moe_ranks(options: _DumpOptions) -> None:
+    """Refuse a rank filter under which this rank writes MoE records but its
+    tensor-parallel rank 0, which alone writes the tensors identical on every
+    rank, does not.
+
+    vLLM numbers ranks with the tensor-parallel rank innermost, so a group's
+    rank 0 is this rank minus its tensor-parallel rank.
+    """
+    if options.ranks is None:
+        return
+    rank = _step._distributed_rank()[0]
+    tensor_parallel = _step._tensor_parallel()
+    leader = rank - tensor_parallel[0] if tensor_parallel else 0
+    if options.selects_rank(rank) and not options.selects_rank(leader):
+        raise RuntimeError(
+            f"{_MOE_ENV} is set and {_RANKS_ENV} selects rank {rank} but not "
+            f"rank {leader}, its tensor-parallel rank 0, which alone writes the "
+            "MoE tensors identical on every rank; add rank "
+            f"{leader} to {_RANKS_ENV}"
+        )
+
+
+def _visit_all(
+    visitors: list[Callable[[torch.nn.Module], None]],
+) -> Callable[[torch.nn.Module], None]:
+    def visit(module: torch.nn.Module) -> None:
+        for visitor in visitors:
+            visitor(module)
+
+    return visit
 
 
 _session: _Session | None = None
@@ -139,6 +198,9 @@ def _reset() -> None:
         attention = session.attention
         if attention is not None:
             attention.remove()
+        moe = session.moe
+        if moe is not None:
+            moe.remove()
         session.writer.close()
     _session = None
     _loaded = False
