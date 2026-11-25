@@ -557,13 +557,11 @@ def calculate_fp8_scale_for_nvfp4(
         (global_amax == 0) | torch.isinf(global_amax) | torch.isnan(global_amax)
     )
 
-    elem_format_max = max_pos
-
     # shape=(H*W//(block_size.m*block_size.n),)
-    local_unscale = (local_amax / elem_format_max).to(torch.float32)
+    local_unscale = (local_amax / max_pos).to(torch.float32)
     # shape=(H//block_size.m,)
     two_level_scale = _nvfp4_global_scale_or_one(
-        global_amax, nvfp4_global_scale(global_amax, elem_format_max)
+        global_amax, nvfp4_global_scale(global_amax, max_pos)
     )
 
     if global_scale_granularity == GlobalScaleGranularity.ROWWISE:
@@ -592,7 +590,6 @@ def calculate_fp8_scale_for_nvfp4(
             global_amax_invalid
             | local_amax_invalid.view(num_blocks_row, num_blocks_col)
         ).view(local_amax_shape)
-        amax_invalid = amax_invalid.view(local_amax_shape)
     else:
         amax_invalid = local_amax_invalid | global_amax_invalid
 

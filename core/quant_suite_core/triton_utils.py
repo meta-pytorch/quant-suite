@@ -401,6 +401,32 @@ def _mul_rn(a, b):
 
 
 @jit
+def _block_unscale(
+    delta,
+    max_pos: tl.constexpr,
+    max_pow2: tl.constexpr,
+    e8m0_norm_exp: tl.constexpr,
+    scale_norm_mode: tl.constexpr,
+    quant_mode: tl.constexpr,
+):
+    """``delta`` divided by ``max_pow2`` under POW2MAX, else by ``max_pos``."""
+    # Triton's `/` by a constant multiplies by its rounded reciprocal. Divide
+    # correctly rounded instead, as qdq() does, unless the divisor is a power
+    # of two (exact either way) or under ASYMM_MEAN_SHIFT, which keeps `/`
+    # (not `div_rn`) in qdq() and here.
+    if scale_norm_mode == "pow2max":
+        if e8m0_norm_exp != 0 or quant_mode == "asymm_mean_shift":
+            unscale = delta / max_pow2
+        else:
+            unscale = tl.math.div_rn(delta, max_pow2)
+    elif quant_mode == "asymm_mean_shift":
+        unscale = delta / max_pos
+    else:  # amax
+        unscale = tl.math.div_rn(delta, max_pos)
+    return unscale
+
+
+@jit
 def _cal_fp32_scale_unscale(
     unscale,
     pre,
@@ -995,25 +1021,13 @@ def _mega_fake_quant_triton_kernel(
         abs_vals = tl.abs(data_hp)
         delta = tl.max(abs_vals, 1)
 
-    # Triton's `/` by a constant multiplies by its rounded reciprocal. Divide
-    # correctly rounded instead, as qdq() does, unless the divisor is a power
-    # of two (exact either way) or under ASYMM_MEAN_SHIFT, which keeps `/`
-    # (not `div_rn`) in qdq() and here.
-    if scale_norm_mode == "pow2max":
-        if e8m0_norm_exp != 0 or quant_mode == "asymm_mean_shift":
-            unscale = delta / max_pow2
-        else:
-            unscale = tl.math.div_rn(delta, max_pow2)
-    elif quant_mode == "asymm_mean_shift":
-        unscale = delta / max_pos
-    else:  # amax
-        unscale = tl.math.div_rn(delta, max_pos)
-    quant_unscale = unscale
-
     """
     Cast scaling factor
     """
     if scale_dtype == "fp32":
+        unscale = _block_unscale(
+            delta, max_pos, max_pow2, e8m0_norm_exp, scale_norm_mode, quant_mode
+        )
         if quant_mode == "asymm_mean_shift":
             unscale = tl.maximum(unscale, 1.0e-12)
             fp32_pre = 1.0
@@ -1028,6 +1042,9 @@ def _mega_fake_quant_triton_kernel(
         quant_unscale = unscale
         scale, unscale = _cal_fp32_scale_unscale(unscale, fp32_pre)
     elif scale_dtype == "fp16":
+        unscale = _block_unscale(
+            delta, max_pos, max_pow2, e8m0_norm_exp, scale_norm_mode, quant_mode
+        )
         if quant_mode == "asymm_mean_shift":
             unscale = tl.maximum(unscale, 1.0e-12)
         else:
@@ -1075,20 +1092,22 @@ def _mega_fake_quant_triton_kernel(
             use_local_amax=use_local_amax,
         )
     elif scale_dtype == "e8m0":
-        if scale_norm_mode == "pow2max":
+        if scale_norm_mode == "pow2max" and e8m0_norm_exp != 0:
             # Round amax (delta) then fold /max_pow2 as an integer exponent
             # shift, instead of rounding the (possibly subnormal) delta/max_pow2.
-            # For non-pow2 max_pow2 (E8Mx) e8m0_norm_exp == 0 and we fall back to
-            # the pre-divided `unscale` (= delta / max_pow2).
             scale, unscale = _cal_fp32_to_e8m0_scale_unscale(
-                delta if e8m0_norm_exp != 0 else unscale,
+                delta,
                 mbits,
                 scale_round_mode,
                 e8m0_norm_exp,
             )
         else:
+            # For non-pow2 max_pow2 (E8Mx) e8m0_norm_exp == 0 and we fall back to
+            # the pre-divided delta / max_pow2.
             scale, unscale = _cal_fp32_to_e8m0_scale_unscale(
-                unscale,
+                _block_unscale(
+                    delta, max_pos, max_pow2, e8m0_norm_exp, scale_norm_mode, quant_mode
+                ),
                 mbits,
                 scale_round_mode,
             )
@@ -1103,7 +1122,7 @@ def _mega_fake_quant_triton_kernel(
         if scale_dtype == "fp8":
             tl.store(
                 local_unscale_ptr + row_offset,
-                local_unscale_fp8.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+                local_unscale_fp8.to(tl.uint8, bitcast=True),
                 mask=row_offset < new_M,
             )
         else:  # e8m0: extract biased exponent as uint8
