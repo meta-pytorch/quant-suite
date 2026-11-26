@@ -48,11 +48,14 @@ class QuantSuiteMoEMethodTest(unittest.TestCase):
             tp_rank=tp_rank,
         )
         config_type: Any = FusedMoEConfig
-        size_argument = (
+        config_parameters = signature(config_type).parameters
+        layout_arguments: dict[str, Any] = (
             {"intermediate_size": intermediate_size}
-            if "intermediate_size" in signature(config_type).parameters
+            if "intermediate_size" in config_parameters
             else {"intermediate_size_per_partition": intermediate_size // tp_size}
         )
+        if "is_act_and_mul" in config_parameters:
+            layout_arguments["is_act_and_mul"] = activation.is_gated
         with patch(
             "vllm.model_executor.layers.fused_moe.config."
             "current_platform.is_cuda_alike",
@@ -67,12 +70,11 @@ class QuantSuiteMoEMethodTest(unittest.TestCase):
                     num_local_experts=num_experts,
                     num_logical_experts=num_experts,
                     activation=activation,
-                    is_act_and_mul=activation.is_gated,
                     device="cpu",
                     routing_method=RoutingMethodType.Default,
                     moe_parallel_config=parallel_config,
                     in_dtype=torch.bfloat16,
-                    **size_argument,
+                    **layout_arguments,
                 ),
             )
 
@@ -308,11 +310,16 @@ class QuantSuiteMoEMethodTest(unittest.TestCase):
             use_ep=True,
             ep_size=2,
         )
-        moe_config = replace(
-            base_config,
-            num_local_experts=local_num_experts,
-            moe_parallel_config=parallel_config,
-        )
+        with patch(
+            "vllm.model_executor.layers.fused_moe.config."
+            "current_platform.is_cuda_alike",
+            return_value=True,
+        ):
+            moe_config = replace(
+                base_config,
+                num_local_experts=local_num_experts,
+                moe_parallel_config=parallel_config,
+            )
         method = QuantSuiteMoEMethod(
             QuantRecipe(moe_recipe={"model.layers.0.mlp": self.recipe}),
             "model.layers.0.mlp",
