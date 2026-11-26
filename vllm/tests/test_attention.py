@@ -29,7 +29,7 @@ from quant_suite_vllm.attention.backend import (
 from quant_suite_vllm.attention.method import QuantSuiteAttentionMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.platforms.interface import DeviceCapability
-from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
+from vllm.v1.attention.backend import AttentionCGSupport, AttentionType, MultipleOf
 from vllm.v1.attention.backends.flex_attention import (
     FlexAttentionBackend,
     FlexAttentionMetadata,
@@ -83,6 +83,15 @@ class QuantSuiteAttentionBackendTest(unittest.TestCase):
         supported_layouts = QuantSuiteAttentionBackend.supported_kv_cache_layouts()
         if supported_layouts is not None:
             self.assertEqual(supported_layouts[0].name, "LBNHC")
+
+    def test_kernel_block_sizes_accept_optional_kv_cache_spec(self) -> None:
+        get_sizes = QuantSuiteAttentionBackend.get_supported_kernel_block_sizes
+        kv_cache_spec = SimpleNamespace(block_size=16, sliding_window=None)
+
+        for sizes in (get_sizes(), get_sizes(kv_cache_spec)):
+            self.assertEqual(len(sizes), 1)
+            self.assertIsInstance(sizes[0], MultipleOf)
+            self.assertEqual(cast(MultipleOf, sizes[0]).base, 1)
 
     def test_binds_prepared_attention_once(self) -> None:
         impl = QuantSuiteAttentionImpl(
