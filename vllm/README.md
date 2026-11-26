@@ -6,11 +6,12 @@ deserialization and Linear, MoE, Attention, MLA, and KDA setup use one recipe
 runtime, selected once per process (see [Recipe runtime](#recipe-runtime));
 callers do not inject runtimes into method constructors.
 
-The package targets `vllm>=0.30,<0.31` and was validated with vLLM 0.30.0.
+The package targets `vllm>=0.33,<0.34`.
 
 For a complete installation, serving, smoke-test, and lm-eval workflow, see
 [`examples/README.md`](examples/README.md). The recorded limit-100 validation
-matrix is in [`examples/results/QUICK_VALIDATION_RESULTS.md`](examples/results/QUICK_VALIDATION_RESULTS.md).
+matrix, measured with vLLM 0.30.0, is in
+[`examples/results/QUICK_VALIDATION_RESULTS.md`](examples/results/QUICK_VALIDATION_RESULTS.md).
 
 ```python
 from quant_suite_vllm.plugin import register
@@ -101,7 +102,7 @@ vLLM.
 Applications that do not use entry-point discovery can call
 `quant_suite_vllm.plugin.register()` before constructing vLLM engine arguments.
 
-The examples install vLLM 0.30.0 and lm-evaluation-harness 0.4.13 in an
+The examples install vLLM 0.33.0 and lm-evaluation-harness 0.4.13 in an
 isolated environment, then install the local QuantSuite packages in editable
 mode. Both pip and uv workflows are provided.
 

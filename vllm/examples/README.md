@@ -1,9 +1,9 @@
 # QuantSuite vLLM examples
 
-These examples reproduce the QuantSuite validation with vLLM 0.30.0
-and lm-evaluation-harness 0.4.13. Llama 3.1 8B Instruct and Qwen3-8B use one
-16-configuration GSM8K protocol. OLMoE, DeepSeek, and Kimi use their
-model-appropriate protocols.
+These examples reproduce the QuantSuite validation. The recorded results were
+measured with vLLM 0.30.0 and lm-evaluation-harness 0.4.13. Llama 3.1 8B
+Instruct and Qwen3-8B use one 16-configuration GSM8K protocol. OLMoE, DeepSeek,
+and Kimi use their model-appropriate protocols.
 
 The low-bit formats follow [*Unveiling the Potential of Quantization with
 MXFP4: Strategies for Quantization Error
@@ -14,7 +14,7 @@ which is released under the MIT license.
 ## Environment
 
 Create an isolated environment with either uv or pip. Both scripts install the
-released `vllm==0.30.0` wheel, `lm-eval[api]==0.4.13`, and editable local copies
+released `vllm==0.33.0` wheel, `lm-eval[api]==0.4.13`, and editable local copies
 of `quant_suite_core`, `quant_suite_recipe`, and `quant_suite_vllm`.
 
 ```bash

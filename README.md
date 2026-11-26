@@ -68,7 +68,7 @@ depends on both. Experimental packages have no stability guarantee.
 ## Install
 
 All packages require Python 3.11 or newer and PyTorch 2.13 or newer.
-`quant_suite_vllm` targets `vllm>=0.30,<0.31`.
+`quant_suite_vllm` targets `vllm>=0.33,<0.34`.
 
 The packages are installed from source. From a checkout of this repository:
 

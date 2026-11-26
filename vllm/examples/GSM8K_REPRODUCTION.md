@@ -1,9 +1,9 @@
 # Reproducing the GSM8K results
 
 These steps reproduce the tables in
-[`results/GSM8K_RESULTS.md`](results/GSM8K_RESULTS.md) with vLLM 0.30.0 and
-`lm-eval[api]==0.4.13`. [`README.md`](README.md) describes the benchmark, the
-paper the formats follow, and the validated models.
+[`results/GSM8K_RESULTS.md`](results/GSM8K_RESULTS.md), which were measured
+with vLLM 0.30.0 and `lm-eval[api]==0.4.13`. [`README.md`](README.md) describes
+the benchmark, the paper the formats follow, and the validated models.
 
 ## 1. Install
 
@@ -17,7 +17,7 @@ ENV_DIR=/path/to/quant-suite-vllm-env bash examples/setup_pip.sh
 source /path/to/quant-suite-vllm-env/bin/activate
 ```
 
-The launchers install vLLM 0.30.0, `lm-eval[api]==0.4.13`, and editable
+The launchers install vLLM 0.33.0, `lm-eval[api]==0.4.13`, and editable
 copies of QuantSuite core, recipe, and vLLM integration packages.
 
 ## 2. Unified protocol

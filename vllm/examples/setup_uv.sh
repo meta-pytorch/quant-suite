@@ -30,7 +30,7 @@ if [[ -n "$VLLM_SOURCE" ]]; then
 else
   uv pip install \
     --python "$env_python" \
-    'vllm==0.30.0' \
+    'vllm==0.33.0' \
     --torch-backend=auto
 fi
 

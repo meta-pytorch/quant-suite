@@ -16,7 +16,7 @@ dependencies = [
     "quant_suite_core>=0.1.0",
     "quant_suite_recipe>=0.1.0",
     "torch>=2.13",
-    "vllm>=0.30,<0.31",
+    "vllm>=0.33,<0.34",
 ]
 
 [project.urls]

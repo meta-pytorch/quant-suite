@@ -198,8 +198,9 @@ token order, as linear layers do:
   tokens per chunk, at least one), so the dump adds at most that to the layer's GPU
   memory, which vLLM's memory profiling does not see. The copies are
   synchronous, so written steps are slower.
-- `gemm2` needs an experts kernel with a `post_gemm2_hook` (the experts
-  kernels of vLLM 0.30 have none), and `topk_ids` one that supports vLLM's
+- `gemm2` needs an experts kernel whose `post_gemm2_hook` is set (the dump
+  wraps the hook and does not install one; vLLM 0.33 leaves it unset unless
+  the model sets it), and `topk_ids` one that supports vLLM's
   routed-experts capture (or a router that runs before the kernel); a selected
   tensor the kernel cannot provide raises `NotImplementedError` at the first
   forward. A kernel that routes and reduces the tokens itself without such a

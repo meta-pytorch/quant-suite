@@ -60,9 +60,9 @@ recipe.
 
 ## Unified Llama/Qwen protocol
 
-The Llama and Qwen tables use vLLM 0.30.0, lm-evaluation-harness 0.4.13, and
-the `gsm8k_llama` version 3 task with fixed 8-shot CoT through local chat
-completions. The full protocol and the commands are in
+The Llama and Qwen tables were measured with vLLM 0.30.0, lm-evaluation-harness
+0.4.13, and the `gsm8k_llama` version 3 task with fixed 8-shot CoT through
+local chat completions. The full protocol and the commands are in
 [`GSM8K_REPRODUCTION.md`](../GSM8K_REPRODUCTION.md#2-unified-protocol). Flash
 and Custom rows differ only in client concurrency and request timeout, which do
 not alter the task, prompt construction, chat rendering, generation, or
@@ -134,8 +134,8 @@ These rows use the experimental
 preset: the `mxfp4_ocp` format (E2M1, 1x32 blocks, E8M0 `pow2max` scale, floor
 rounding) with two extra mantissa bits on each block's largest element. They
 are not part of the 16-configuration matrix above. They use the same unified
-protocol, vLLM 0.30.0 and lm-evaluation-harness 0.4.13, with
-`quant_suite_mx_plus` installed so the plugin selects the `mx_plus` recipe
+protocol and were measured with vLLM 0.30.0 and lm-evaluation-harness 0.4.13,
+with `quant_suite_mx_plus` installed so the plugin selects the `mx_plus` recipe
 runtime. The `bf16` and `mxfp4_ocp_core` rows are repeated from the tables
 above for comparison; `mxfp4_ocp_core` differs from `mxfp4_plus2_core` only by
 the MX+ extension. Steps to reproduce are in

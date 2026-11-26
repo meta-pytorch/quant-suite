@@ -48,13 +48,13 @@ The [README](README.md) is the reference for every option and file format.
 
 ## 2. Install
 
-The QuantSuite vLLM plugin requires `vllm>=0.30,<0.31` (see
+The QuantSuite vLLM plugin requires `vllm>=0.33,<0.34` (see
 [`../../vllm/pyproject.toml`](../../vllm/pyproject.toml)). Install that first,
 then the QuantSuite packages from a checkout:
 
 ```bash
 python -m venv dump-env && source dump-env/bin/activate
-pip install "vllm>=0.30,<0.31"
+pip install "vllm>=0.33,<0.34"
 
 git clone https://github.com/meta-pytorch/quant-suite
 cd quant-suite
@@ -150,9 +150,11 @@ export QUANT_SUITE_TENSOR_DUMP_MOE_TENSORS=input,router_logits,topk_ids,topk_wei
   kernel routed each token with, the unweighted output of the second expert
   GEMM of every route (`gemm2`, `[tokens, top_k, hidden]`), and the layer's
   `output`. The default leaves out `gemm2`, which is `top_k` times the size
-  of `input` on every rank. `gemm2` needs an experts kernel with a
-  `post_gemm2_hook`, which the experts kernels of vLLM 0.30 do not have; the
-  dump raises `NotImplementedError` at the first forward otherwise.
+  of `input` on every rank. `gemm2` needs an experts kernel whose
+  `post_gemm2_hook` is set. The dump wraps that hook and does not install one,
+  since the hook replaces the kernel's top-k reduction; vLLM 0.33 leaves it
+  unset unless the model sets it. Without a hook the dump raises
+  `NotImplementedError` at the first forward.
 - With tensor parallelism, `input`, `router_logits` and `output` are the same
   on every rank and only tensor-parallel rank 0 writes them. `gemm2` is each
   rank's partial sum over its share of the intermediate dimension.

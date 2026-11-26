@@ -79,7 +79,7 @@ def _wrap_forward_with_state_quantization(layer: torch.nn.Module) -> None:
         if attn_metadata is None:
             return
         if not isinstance(attn_metadata, dict):
-            raise RuntimeError("vLLM 0.30 KDA metadata must be keyed by layer name")
+            raise RuntimeError("vLLM KDA metadata must be keyed by layer name")
 
         dynamic_self: Any = self
         layer_metadata = attn_metadata.get(dynamic_self.prefix)

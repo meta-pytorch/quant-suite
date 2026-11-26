@@ -7,6 +7,10 @@ change before 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- `quant_suite_vllm` targets `vllm>=0.33,<0.34`.
+
 ## 0.1.0
 
 Initial public release.

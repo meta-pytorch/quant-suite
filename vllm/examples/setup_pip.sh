@@ -26,7 +26,7 @@ env_python="$ENV_DIR/bin/python"
 if [[ -n "$VLLM_SOURCE" ]]; then
   VLLM_USE_PRECOMPILED=1 "$env_python" -m pip install --editable "$VLLM_SOURCE"
 else
-  "$env_python" -m pip install 'vllm==0.30.0'
+  "$env_python" -m pip install 'vllm==0.33.0'
 fi
 
 if [[ -n "$LM_EVAL_SOURCE" ]]; then
